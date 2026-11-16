@@ -15,7 +15,7 @@ pub mod ssh;
 use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
 
-use crate::model::{AgentStatus, ItemInfo, KeyringInfo, SshKeyInfo};
+use crate::model::{AgentStatus, GpgFilter, GpgKeyInfo, ItemInfo, KeyringInfo, SshKeyInfo};
 
 /// Commands for the Secret Service backend.
 #[derive(Debug, PartialEq, Eq)]
@@ -37,6 +37,15 @@ pub enum SecretsRequest {
         keyring: usize,
         item: usize,
     },
+}
+
+/// Commands for the GPG backend.
+///
+/// Read-only by design: everything that changes a key runs as an external
+/// `gpg` command with the TUI suspended. See [`crate::app::GpgAction`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum GpgRequest {
+    ListKeys { filter: GpgFilter },
 }
 
 /// Commands for the SSH backend.
@@ -71,6 +80,14 @@ pub enum Reply {
         keys: Vec<SshKeyInfo>,
         agent: AgentStatus,
     },
+    GpgKeys {
+        keys: Vec<GpgKeyInfo>,
+        /// Echoed back so a reply for a filter the user has since changed can
+        /// be discarded.
+        filter: GpgFilter,
+        /// The gpg engine behind the listing, for the status line.
+        engine: String,
+    },
     /// Transient message for the status line, plus whatever the operation
     /// invalidated. A backend says what to re-read rather than the UI
     /// guessing, so a lock in one section cannot trigger a reload in another.
@@ -86,6 +103,7 @@ pub enum Reply {
 pub enum Refresh {
     Keyrings,
     SshKeys,
+    GpgKeys,
 }
 
 /// The channel a backend uses to report back. Send failures mean the UI is

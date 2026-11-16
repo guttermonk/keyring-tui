@@ -64,8 +64,9 @@ async fn main() -> Result<()> {
 async fn run(mut terminal: ratatui::DefaultTerminal) -> Result<()> {
     let (reply_tx, mut replies) = mpsc::unbounded_channel::<Reply>();
     let secrets = backend::secrets::spawn(reply_tx.clone());
-    let ssh = backend::ssh::spawn(reply_tx);
-    let mut app = App::new(secrets, ssh);
+    let ssh = backend::ssh::spawn(reply_tx.clone());
+    let gpg = backend::gpg::spawn(reply_tx);
+    let mut app = App::new(secrets, ssh, gpg);
 
     let mut input = EventStream::new();
 
@@ -96,7 +97,7 @@ async fn run(mut terminal: ratatui::DefaultTerminal) -> Result<()> {
             drop(input);
             let outcome = suspended(&mut terminal, || run_external(&external))?;
             input = EventStream::new();
-            app.on_external_done(outcome);
+            app.on_external_done(&external, outcome);
         }
     }
 

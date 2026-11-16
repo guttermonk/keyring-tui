@@ -137,6 +137,103 @@ impl SshKeyInfo {
     }
 }
 
+/// A key from the local GnuPG keyring.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpgKeyInfo {
+    /// Index into the backend's key table; the backend is addressed by it.
+    pub id: usize,
+    /// Long key ID, as `gpg --list-keys --keyid-format long` prints it.
+    pub key_id: String,
+    pub fingerprint: String,
+    /// First user ID, which GnuPG treats as the primary one.
+    pub primary_uid: String,
+    pub uids: Vec<GpgUid>,
+    pub subkeys: Vec<GpgSubkey>,
+    /// Algorithm of the primary key. gpgme spells these the way gpg does and
+    /// folds the size in where it matters — `rsa4096`, `ed25519`, `nistp256`
+    /// — so there is no separate bit count to report.
+    pub algorithm: String,
+    pub created: Option<Duration>,
+    /// `None` means the key does not expire.
+    pub expires: Option<Duration>,
+    pub owner_trust: &'static str,
+    /// The private key is present in this keyring.
+    pub has_secret: bool,
+    pub revoked: bool,
+    pub expired: bool,
+    pub disabled: bool,
+    /// Aggregate capability letters across the key, in `escaESCA` style —
+    /// lowercase for the primary key, see [`GpgSubkey::capabilities`].
+    pub capabilities: String,
+    /// At least one subkey lives on a smartcard.
+    pub on_card: bool,
+}
+
+impl GpgKeyInfo {
+    /// Short state label for the list column: the first thing wrong with the
+    /// key, or its usability if nothing is.
+    pub fn state(&self) -> Option<&'static str> {
+        if self.revoked {
+            Some("revoked")
+        } else if self.expired {
+            Some("expired")
+        } else if self.disabled {
+            Some("disabled")
+        } else {
+            None
+        }
+    }
+}
+
+/// One user ID on a GPG key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpgUid {
+    /// The whole `Name (comment) <email>` string.
+    pub uid: String,
+    pub validity: &'static str,
+    pub revoked: bool,
+}
+
+/// One subkey on a GPG key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpgSubkey {
+    pub key_id: String,
+    pub algorithm: String,
+    pub created: Option<Duration>,
+    pub expires: Option<Duration>,
+    /// Capability letters: `s`ign, `c`ertify, `e`ncrypt, `a`uthenticate.
+    pub capabilities: String,
+    pub revoked: bool,
+    pub expired: bool,
+    pub has_secret: bool,
+    pub on_card: bool,
+}
+
+/// Which keys the GPG section is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpgFilter {
+    /// Every key in the local keyring.
+    All,
+    /// Only keys whose private half we hold.
+    Secret,
+}
+
+impl GpgFilter {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::All => Self::Secret,
+            Self::Secret => Self::All,
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::All => "all keys",
+            Self::Secret => "secret keys",
+        }
+    }
+}
+
 /// Whether the ssh-agent could be reached, and how many keys it holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentStatus {

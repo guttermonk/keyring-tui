@@ -40,6 +40,7 @@ jiff = "1.0"
 # OpenSSH key parsing. Deliberately no algorithm crypto features: we only read
 # metadata and fingerprints, and never sign, verify or decrypt a private key.
 ssh-key = { version = "0.6", default-features = false, features = ["std", "ecdsa"] }
+gpgme = "0.11"
 
 [dev-dependencies]
 tempfile = "3.27"

@@ -3,9 +3,10 @@
 A terminal replacement for [GNOME Seahorse](https://gitlab.gnome.org/GNOME/seahorse):
 one TUI for stored passwords, GPG keys and SSH keys.
 
-> **Status: early.** The Passwords (Secret Service) and SSH Keys sections work;
-> both are read-only apart from locking a keyring, managing the ssh-agent, and
-> generating a key. The GPG section is a stub that shows its roadmap.
+> **Status: early.** All three sections work. Listing and inspection are
+> complete; the write operations implemented so far are locking a keyring,
+> managing the ssh-agent, generating SSH and GPG keys, and the whole of
+> `gpg --edit-key`. See the roadmap for what is still missing.
 
 ## Running
 
@@ -16,8 +17,10 @@ nix develop        # rustc, cargo, clippy, rust-analyzer, gpgme, nettle, gnupg�
 cargo run
 ```
 
-Without Nix you need a Rust toolchain plus `pkg-config`, and — once the GPG
-backend lands — `libgpgme`, `libgpg-error` and `libassuan`.
+Without Nix you need a Rust toolchain, `pkg-config`, and `libgpgme` with its
+`libgpg-error` and `libassuan` dependencies — `gpgme` is a C binding, so
+`cargo build` outside the dev shell will not find it on its own. At runtime it
+wants `gpg`, `ssh-add`/`ssh-keygen`, and a Secret Service on the session bus.
 
 ```console
 nix build          # or: cargo build --release
@@ -50,6 +53,17 @@ In **SSH Keys**:
 | `x` | remove the selected key from the agent |
 | `n` | generate a key (runs `ssh-keygen`) |
 
+In **GPG Keys**:
+
+| Key | Action |
+| --- | --- |
+| `e` | edit: trust, expiry, user IDs, revocation, certifying (`gpg --edit-key`) |
+| `y` | print the armoured public key |
+| `n` | generate a key (`gpg --full-generate-key`) |
+| `p` | publish to a keyserver — asks first |
+| `x` | delete the key — asks first |
+| `f` | show all keys / only keys with a private half |
+
 ## Architecture
 
 ```
@@ -60,7 +74,7 @@ model.rs     domain types the UI speaks (KeyringInfo, ItemInfo, Section)
 backend/     one actor per section, each owning its own I/O
   secrets.rs Secret Service over D-Bus, via oo7
   ssh.rs     ~/.ssh via ssh-key, plus an ssh-agent protocol client
-  gpg.rs     planned: gpgme against the real ~/.gnupg
+  gpg.rs     the GnuPG keyring via gpgme
 ```
 
 Backends are actors: the UI posts a request and never awaits a reply, so a
@@ -71,11 +85,17 @@ tested without a session bus — see the tests in `src/app.rs`.
 The event loop is fully event-driven. There is no tick or poll interval, so an
 idle keyring-tui costs nothing.
 
-Anything that needs a passphrase or a touch on a security key runs as an
-external command with the TUI suspended — `ssh-add` and `ssh-keygen` get the
-real terminal, do their own prompting, and the list is re-read when they exit.
-That keeps passphrases and private key material out of this process entirely,
-and means `-sk` keys, askpass and confirmation all behave exactly as usual.
+Anything that needs a passphrase, a touch on a security key, or a network
+round trip runs as an external command with the TUI suspended — `ssh-add`,
+`ssh-keygen` and `gpg` get the real terminal, do their own prompting, and the
+affected list is re-read when they exit. That keeps passphrases and private
+key material out of this process entirely, and means `-sk` keys, askpass,
+pinentry and gpg's own confirmations all behave exactly as usual.
+
+It also sets the boundary for the GPG section: reading goes through `gpgme`,
+because structured access to user IDs, subkeys, capabilities and validity is
+worth a library; writing goes through `gpg --edit-key` and friends, because
+reimplementing gpg's prompts would be both more code and less safe.
 
 ## Handling secrets
 
@@ -113,26 +133,48 @@ and means `-sk` keys, askpass and confirmation all behave exactly as usual.
 - [ ] delete a key
 - [ ] copy the public key or fingerprint to the clipboard
 
-**GPG keys** — see `src/backend/gpg.rs` for the full checklist: list with
-trust/expiry/capabilities, key details, generate, import/export, certify, set
-owner trust, change expiry, revoke, and keyserver search/receive/publish.
+**GPG keys**
+
+- [x] list keys with algorithm, owner trust, capabilities and expiry
+- [x] flag keys we hold a private half for, and smartcard-backed subkeys
+- [x] details: user IDs with validity, subkeys, grouped fingerprint
+- [x] filter to only keys with a private half
+- [x] generate a key (`gpg --full-generate-key`)
+- [x] edit — trust, expiry, user IDs, revocation, certifying (`gpg --edit-key`)
+- [x] print the armoured public key
+- [x] publish to a keyserver, and delete a key, both behind a confirmation
+- [ ] import from a file, and keyserver search (both need a text input widget)
+- [ ] per-user-ID signature listing, which is Seahorse's "Signatures" tab
+- [ ] photo IDs
+- [ ] S/MIME keys, which gpgme exposes through `Protocol::CMS`
 
 ## Tests
 
 ```console
-cargo test                                                  # no D-Bus, agent or disk needed
+cargo test                                                  # no D-Bus, agent, gpg or disk needed
 cargo test --test secret_service -- --ignored --nocapture    # live keyring, metadata only
 cargo test ssh::tests::live -- --ignored --nocapture         # live ~/.ssh and agent
+cargo test gpg::tests::live -- --ignored --nocapture         # live ~/.gnupg
 ```
 
-The default suite covers the state machine against fake backends and the SSH
-scanner against key fixtures in a temporary directory.
+The default suite covers the state machine against fake backends, the SSH
+scanner against key fixtures in a temporary directory, ssh-agent wire-format
+parsing, and rendering through ratatui's `TestBackend`.
 
-The ignored tests read from your real environment. They are deliberately
+The ignored tests read from your real environment and are deliberately
 side-effect free: the keyring one reads labels, lock state and item counts
 without fetching a secret or unlocking anything; the SSH ones read key
-metadata and ask the agent what it holds, and the removal test uses a fixture
-key the agent cannot be holding, so nothing is removed.
+metadata and ask the agent what it holds, with the removal test using a
+fixture key the agent cannot be holding; the GPG one only lists keys.
+
+To exercise the GPG section — including the operations that write — point it
+at a throwaway keyring rather than your own:
+
+```console
+export GNUPGHOME=$(mktemp -d) && chmod 700 "$GNUPGHOME"
+gpg --batch --passphrase '' --quick-generate-key 'Test <test@example.invalid>' ed25519
+cargo run
+```
 
 ## License
 

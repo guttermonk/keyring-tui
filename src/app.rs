@@ -13,8 +13,10 @@ use ratatui::widgets::ListState;
 use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
 
-use crate::backend::{Refresh, Reply, SecretsRequest, SshRequest};
-use crate::model::{AgentStatus, ItemInfo, KeyringInfo, Section, SshKeyInfo};
+use crate::backend::{GpgRequest, Refresh, Reply, SecretsRequest, SshRequest};
+use crate::model::{
+    AgentStatus, GpgFilter, GpgKeyInfo, ItemInfo, KeyringInfo, Section, SshKeyInfo,
+};
 
 /// Which of the two list panes has the keyboard, in the Passwords section.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -28,6 +30,47 @@ pub enum Pane {
 pub enum Prompt {
     /// Choose an algorithm for a new SSH key.
     NewSshKey,
+    /// Confirm deleting the selected GPG key. gpg asks again, but a stray
+    /// keypress should not start a delete flow at all.
+    ConfirmGpgDelete,
+    /// Confirm publishing the selected GPG key to a keyserver. Keyservers do
+    /// not forget, so this one is not undoable.
+    ConfirmGpgPublish,
+}
+
+/// A `gpg` invocation. Everything that changes a key goes through the CLI so
+/// that pinentry, confirmations and keyserver output behave as usual.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GpgAction {
+    /// `--full-generate-key`, which prompts for algorithm, identity and
+    /// passphrase itself.
+    Generate,
+    /// `--edit-key`: trust, expiry, user IDs, revocation, certifying.
+    Edit,
+    /// `--armor --export`, printed to the terminal for copying.
+    Export,
+    /// `--send-keys`, which publishes to the configured keyserver.
+    Publish,
+    /// `--delete-key`. gpg refuses when a private key is present and points
+    /// at `--delete-secret-keys`, which is the safe default here: losing a
+    /// public key is recoverable, losing a private one is not.
+    Delete,
+}
+
+impl GpgAction {
+    fn args(self, fingerprint: Option<&str>) -> Vec<String> {
+        let mut args: Vec<String> = match self {
+            Self::Generate => vec!["--full-generate-key".into()],
+            Self::Edit => vec!["--edit-key".into()],
+            Self::Export => vec!["--armor".into(), "--export".into()],
+            Self::Publish => vec!["--send-keys".into()],
+            Self::Delete => vec!["--delete-key".into()],
+        };
+        if let Some(fingerprint) = fingerprint {
+            args.push(fingerprint.to_owned());
+        }
+        args
+    }
 }
 
 /// A command that needs the real terminal: it prompts for a passphrase, or
@@ -47,6 +90,11 @@ pub enum External {
         algorithm: &'static str,
         bits: Option<u32>,
     },
+    /// A `gpg` subcommand, optionally against one key.
+    Gpg {
+        action: GpgAction,
+        fingerprint: Option<String>,
+    },
 }
 
 impl External {
@@ -54,6 +102,7 @@ impl External {
         match self {
             Self::SshAdd(_) => "ssh-add",
             Self::SshKeygen { .. } => "ssh-keygen",
+            Self::Gpg { .. } => "gpg",
         }
     }
 
@@ -68,12 +117,24 @@ impl External {
                 }
                 args
             }
+            Self::Gpg {
+                action,
+                fingerprint,
+            } => action.args(fingerprint.as_deref()),
         }
     }
 
     /// Shown while the command runs, so it is obvious what took the terminal.
     pub fn describe(&self) -> String {
         format!("{} {}", self.program(), self.args().join(" "))
+    }
+
+    /// What this command may have changed, so the right list is re-read.
+    pub fn refresh(&self) -> Refresh {
+        match self {
+            Self::SshAdd(_) | Self::SshKeygen { .. } => Refresh::SshKeys,
+            Self::Gpg { .. } => Refresh::GpgKeys,
+        }
     }
 }
 
@@ -100,6 +161,15 @@ pub struct App {
     /// The SSH section scans the disk on first visit, not at startup.
     ssh_loaded: bool,
 
+    // GPG keys.
+    pub gpg_keys: Vec<GpgKeyInfo>,
+    pub gpg_state: ListState,
+    pub gpg_filter: GpgFilter,
+    /// The gpg engine behind the current listing, for the status line.
+    pub gpg_engine: String,
+    /// The GPG section reads the keyring on first visit, not at startup.
+    gpg_loaded: bool,
+
     pub status: String,
     pub error: Option<String>,
     pub show_help: bool,
@@ -110,10 +180,15 @@ pub struct App {
 
     secrets: UnboundedSender<SecretsRequest>,
     ssh: UnboundedSender<SshRequest>,
+    gpg: UnboundedSender<GpgRequest>,
 }
 
 impl App {
-    pub fn new(secrets: UnboundedSender<SecretsRequest>, ssh: UnboundedSender<SshRequest>) -> Self {
+    pub fn new(
+        secrets: UnboundedSender<SecretsRequest>,
+        ssh: UnboundedSender<SshRequest>,
+        gpg: UnboundedSender<GpgRequest>,
+    ) -> Self {
         let app = Self {
             section: Section::Keyrings,
             pane: Pane::Keyrings,
@@ -126,6 +201,11 @@ impl App {
             ssh_state: ListState::default(),
             agent: AgentStatus::NotConfigured,
             ssh_loaded: false,
+            gpg_keys: Vec::new(),
+            gpg_state: ListState::default(),
+            gpg_filter: GpgFilter::All,
+            gpg_engine: String::new(),
+            gpg_loaded: false,
             status: "loading keyrings…".into(),
             error: None,
             show_help: false,
@@ -134,6 +214,7 @@ impl App {
             external: None,
             secrets,
             ssh,
+            gpg,
         };
         app.send(SecretsRequest::ListKeyrings);
         app
@@ -147,6 +228,10 @@ impl App {
 
     fn send_ssh(&self, request: SshRequest) {
         let _ = self.ssh.send(request);
+    }
+
+    fn send_gpg(&self, request: GpgRequest) {
+        let _ = self.gpg.send(request);
     }
 
     pub fn selected_keyring(&self) -> Option<&KeyringInfo> {
@@ -169,6 +254,15 @@ impl App {
         self.ssh_loaded
     }
 
+    pub fn selected_gpg_key(&self) -> Option<&GpgKeyInfo> {
+        self.gpg_state.selected().and_then(|i| self.gpg_keys.get(i))
+    }
+
+    /// Whether the keyring has been read at least once.
+    pub fn gpg_ready(&self) -> bool {
+        self.gpg_loaded
+    }
+
     /// Forget any revealed secret. Called on every navigation.
     fn hide_secret(&mut self) {
         self.revealed = None;
@@ -179,9 +273,8 @@ impl App {
         self.external.take()
     }
 
-    /// Both external commands change what the agent or `~/.ssh` holds, so the
-    /// SSH list is always re-read afterwards.
-    pub fn on_external_done(&mut self, outcome: Result<String, String>) {
+    /// Record how an external command went and re-read whatever it touched.
+    pub fn on_external_done(&mut self, external: &External, outcome: Result<String, String>) {
         match outcome {
             Ok(message) => {
                 self.error = None;
@@ -189,7 +282,17 @@ impl App {
             }
             Err(message) => self.error = Some(message),
         }
-        self.send_ssh(SshRequest::ListKeys);
+        self.refresh_for(external.refresh());
+    }
+
+    fn refresh_for(&self, refresh: Refresh) {
+        match refresh {
+            Refresh::Keyrings => self.send(SecretsRequest::ListKeyrings),
+            Refresh::SshKeys => self.send_ssh(SshRequest::ListKeys),
+            Refresh::GpgKeys => self.send_gpg(GpgRequest::ListKeys {
+                filter: self.gpg_filter,
+            }),
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -242,26 +345,76 @@ impl App {
 
             // SSH only.
             KeyCode::Char('a') => self.add_to_agent(),
-            KeyCode::Char('x') => self.remove_from_agent(),
-            KeyCode::Char('n') => self.begin_new_ssh_key(),
+
+            // GPG only.
+            KeyCode::Char('e') => self.edit_gpg_key(),
+            KeyCode::Char('y') => self.export_gpg_key(),
+            KeyCode::Char('p') => self.confirm(Prompt::ConfirmGpgPublish),
+            KeyCode::Char('f') => self.toggle_gpg_filter(),
+
+            // Section-dependent: remove from the agent, or delete a GPG key.
+            KeyCode::Char('x') => match self.section {
+                Section::SshKeys => self.remove_from_agent(),
+                Section::GpgKeys => self.confirm(Prompt::ConfirmGpgDelete),
+                Section::Keyrings => {}
+            },
+            KeyCode::Char('n') => match self.section {
+                Section::SshKeys => self.prompt = Some(Prompt::NewSshKey),
+                // gpg --full-generate-key asks everything itself, so there is
+                // nothing for us to ask first.
+                Section::GpgKeys => self.run_gpg(GpgAction::Generate, None),
+                Section::Keyrings => {}
+            },
 
             _ => {}
         }
     }
 
     fn handle_prompt_key(&mut self, prompt: Prompt, code: KeyCode) {
+        let cancelled = matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n'));
         match prompt {
             Prompt::NewSshKey => match code {
                 KeyCode::Char('1') => self.generate_ssh_key("ed25519", None),
                 KeyCode::Char('2') => self.generate_ssh_key("ecdsa", Some(521)),
                 KeyCode::Char('3') => self.generate_ssh_key("rsa", Some(4096)),
-                KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Esc | KeyCode::Char('q') => self.cancel_prompt(),
+                _ => {}
+            },
+            Prompt::ConfirmGpgDelete => match code {
+                KeyCode::Char('y') | KeyCode::Enter => {
                     self.prompt = None;
-                    self.status = "cancelled".into();
+                    let fingerprint = self.selected_gpg_key().map(|key| key.fingerprint.clone());
+                    self.run_gpg(GpgAction::Delete, fingerprint);
                 }
+                _ if cancelled => self.cancel_prompt(),
+                _ => {}
+            },
+            Prompt::ConfirmGpgPublish => match code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.prompt = None;
+                    let fingerprint = self.selected_gpg_key().map(|key| key.fingerprint.clone());
+                    self.run_gpg(GpgAction::Publish, fingerprint);
+                }
+                _ if cancelled => self.cancel_prompt(),
                 _ => {}
             },
         }
+    }
+
+    fn cancel_prompt(&mut self) {
+        self.prompt = None;
+        self.status = "cancelled".into();
+    }
+
+    /// Open a confirmation, but only when there is something to confirm.
+    fn confirm(&mut self, prompt: Prompt) {
+        if self.section != Section::GpgKeys {
+            return;
+        }
+        if self.selected_gpg_key().is_none() {
+            return;
+        }
+        self.prompt = Some(prompt);
     }
 
     fn set_section(&mut self, section: Section) {
@@ -274,13 +427,22 @@ impl App {
 
         match section {
             Section::Keyrings => self.status = "keyrings".into(),
-            Section::GpgKeys => self.status = "GPG backend not implemented yet".into(),
             Section::SshKeys => {
                 if self.ssh_loaded {
                     self.status = self.describe_ssh_keys();
                 } else {
                     self.status = "scanning ~/.ssh…".into();
                     self.send_ssh(SshRequest::ListKeys);
+                }
+            }
+            Section::GpgKeys => {
+                if self.gpg_loaded {
+                    self.status = self.describe_gpg_keys();
+                } else {
+                    self.status = "reading the GnuPG keyring…".into();
+                    self.send_gpg(GpgRequest::ListKeys {
+                        filter: self.gpg_filter,
+                    });
                 }
             }
         }
@@ -313,7 +475,9 @@ impl App {
             Section::SshKeys => {
                 step(&mut self.ssh_state, self.ssh_keys.len(), delta);
             }
-            Section::GpgKeys => {}
+            Section::GpgKeys => {
+                step(&mut self.gpg_state, self.gpg_keys.len(), delta);
+            }
         }
     }
 
@@ -325,7 +489,7 @@ impl App {
                 Pane::Items => (&mut self.item_state, self.items.len()),
             },
             Section::SshKeys => (&mut self.ssh_state, self.ssh_keys.len()),
-            Section::GpgKeys => return,
+            Section::GpgKeys => (&mut self.gpg_state, self.gpg_keys.len()),
         };
         if len == 0 {
             return;
@@ -350,7 +514,12 @@ impl App {
                 self.status = "scanning ~/.ssh…".into();
                 self.send_ssh(SshRequest::ListKeys);
             }
-            Section::GpgKeys => {}
+            Section::GpgKeys => {
+                self.status = "reading the GnuPG keyring…".into();
+                self.send_gpg(GpgRequest::ListKeys {
+                    filter: self.gpg_filter,
+                });
+            }
         }
     }
 
@@ -455,13 +624,6 @@ impl App {
         self.send_ssh(SshRequest::RemoveFromAgent { key: id });
     }
 
-    fn begin_new_ssh_key(&mut self) {
-        if self.section != Section::SshKeys {
-            return;
-        }
-        self.prompt = Some(Prompt::NewSshKey);
-    }
-
     fn generate_ssh_key(&mut self, algorithm: &'static str, bits: Option<u32>) {
         self.prompt = None;
         // ssh-keygen prompts for the destination path and the passphrase, so
@@ -471,6 +633,63 @@ impl App {
 
     fn describe_ssh_keys(&self) -> String {
         format!("{} key(s) · {}", self.ssh_keys.len(), self.agent.describe())
+    }
+
+    // --- GPG keys --------------------------------------------------------
+
+    fn edit_gpg_key(&mut self) {
+        if self.section != Section::GpgKeys {
+            return;
+        }
+        // --edit-key on a key we have no private half for still works: it is
+        // how you certify someone else's key and set owner trust.
+        let fingerprint = self.selected_gpg_key().map(|key| key.fingerprint.clone());
+        if fingerprint.is_some() {
+            self.run_gpg(GpgAction::Edit, fingerprint);
+        }
+    }
+
+    fn export_gpg_key(&mut self) {
+        if self.section != Section::GpgKeys {
+            return;
+        }
+        let fingerprint = self.selected_gpg_key().map(|key| key.fingerprint.clone());
+        if fingerprint.is_some() {
+            self.run_gpg(GpgAction::Export, fingerprint);
+        }
+    }
+
+    fn toggle_gpg_filter(&mut self) {
+        if self.section != Section::GpgKeys {
+            return;
+        }
+        self.gpg_filter = self.gpg_filter.toggled();
+        self.status = format!("showing {}…", self.gpg_filter.describe());
+        self.send_gpg(GpgRequest::ListKeys {
+            filter: self.gpg_filter,
+        });
+    }
+
+    /// Park a `gpg` invocation for the event loop to run with the TUI
+    /// suspended. Private key operations prompt through pinentry, so no
+    /// passphrase passes through this process.
+    fn run_gpg(&mut self, action: GpgAction, fingerprint: Option<String>) {
+        if self.section != Section::GpgKeys {
+            return;
+        }
+        self.external = Some(External::Gpg {
+            action,
+            fingerprint,
+        });
+    }
+
+    fn describe_gpg_keys(&self) -> String {
+        format!(
+            "{} {} · {}",
+            self.gpg_keys.len(),
+            self.gpg_filter.describe(),
+            self.gpg_engine
+        )
     }
 
     // --- Replies ---------------------------------------------------------
@@ -540,13 +759,40 @@ impl App {
                 }
             }
 
+            Reply::GpgKeys {
+                keys,
+                filter,
+                engine,
+            } => {
+                // Ignore a listing for a filter the user has since changed.
+                if filter != self.gpg_filter {
+                    return;
+                }
+                // Keep the cursor on the same key across a refresh; the
+                // fingerprint is the only truly stable handle.
+                let previous = self.selected_gpg_key().map(|key| key.fingerprint.clone());
+                self.gpg_keys = keys;
+                self.gpg_engine = engine;
+                self.gpg_loaded = true;
+
+                let restored = previous
+                    .and_then(|fingerprint| {
+                        self.gpg_keys
+                            .iter()
+                            .position(|key| key.fingerprint == fingerprint)
+                    })
+                    .or_else(|| (!self.gpg_keys.is_empty()).then_some(0));
+                self.gpg_state.select(restored);
+
+                if self.section == Section::GpgKeys {
+                    self.status = self.describe_gpg_keys();
+                }
+            }
+
             Reply::Status { message, refresh } => {
                 self.error = None;
                 self.status = message;
-                match refresh {
-                    Refresh::Keyrings => self.send(SecretsRequest::ListKeyrings),
-                    Refresh::SshKeys => self.send_ssh(SshRequest::ListKeys),
-                }
+                self.refresh_for(refresh);
             }
 
             Reply::Error(message) => {
@@ -588,16 +834,19 @@ mod tests {
         app: App,
         secrets: UnboundedReceiver<SecretsRequest>,
         ssh: UnboundedReceiver<SshRequest>,
+        gpg: UnboundedReceiver<GpgRequest>,
     }
 
     impl Harness {
         fn new() -> Self {
             let (secrets_tx, secrets) = mpsc::unbounded_channel();
             let (ssh_tx, ssh) = mpsc::unbounded_channel();
+            let (gpg_tx, gpg) = mpsc::unbounded_channel();
             Self {
-                app: App::new(secrets_tx, ssh_tx),
+                app: App::new(secrets_tx, ssh_tx, gpg_tx),
                 secrets,
                 ssh,
+                gpg,
             }
         }
 
@@ -621,9 +870,18 @@ mod tests {
             out
         }
 
+        fn gpg_requests(&mut self) -> Vec<GpgRequest> {
+            let mut out = Vec::new();
+            while let Ok(request) = self.gpg.try_recv() {
+                out.push(request);
+            }
+            out
+        }
+
         fn drain(&mut self) {
             self.secrets_requests();
             self.ssh_requests();
+            self.gpg_requests();
         }
 
         /// Two keyrings loaded, cursor on the first, its items listed.
@@ -655,6 +913,43 @@ mod tests {
             });
             harness.drain();
             harness
+        }
+
+        /// In the GPG section with two keys: one of our own and one public.
+        fn gpg_loaded() -> Self {
+            let mut harness = Self::loaded();
+            harness.press(KeyCode::Char('2'));
+            harness.app.on_reply(Reply::GpgKeys {
+                keys: vec![
+                    gpg_key(0, "Me <me@example>", true),
+                    gpg_key(1, "Them <them@example>", false),
+                ],
+                filter: GpgFilter::All,
+                engine: "gpg 2.4.9".into(),
+            });
+            harness.drain();
+            harness
+        }
+    }
+
+    fn gpg_key(id: usize, uid: &str, has_secret: bool) -> GpgKeyInfo {
+        GpgKeyInfo {
+            id,
+            key_id: format!("KEYID{id}"),
+            fingerprint: format!("FPR{id}"),
+            primary_uid: uid.into(),
+            uids: Vec::new(),
+            subkeys: Vec::new(),
+            algorithm: "ed25519".into(),
+            created: None,
+            expires: None,
+            owner_trust: "ultimate",
+            has_secret,
+            revoked: false,
+            expired: false,
+            disabled: false,
+            capabilities: "sc".into(),
+            on_card: false,
         }
     }
 
@@ -1058,7 +1353,10 @@ mod tests {
     #[test]
     fn an_external_command_is_followed_by_a_rescan() {
         let mut harness = Harness::ssh_loaded();
-        harness.app.on_external_done(Ok("ssh-add finished".into()));
+        let external = External::SshAdd("/home/u/.ssh/id_rsa".into());
+        harness
+            .app
+            .on_external_done(&external, Ok("ssh-add finished".into()));
 
         assert_eq!(harness.ssh_requests(), vec![SshRequest::ListKeys]);
         assert_eq!(harness.app.status, "ssh-add finished");
@@ -1068,15 +1366,37 @@ mod tests {
     #[test]
     fn a_failed_external_command_reports_and_still_rescans() {
         let mut harness = Harness::ssh_loaded();
+        let external = External::SshAdd("/home/u/.ssh/id_rsa".into());
         harness
             .app
-            .on_external_done(Err("ssh-add exited with status 1".into()));
+            .on_external_done(&external, Err("ssh-add exited with status 1".into()));
 
         assert_eq!(harness.ssh_requests(), vec![SshRequest::ListKeys]);
         assert_eq!(
             harness.app.error.as_deref(),
             Some("ssh-add exited with status 1")
         );
+    }
+
+    #[test]
+    fn an_external_command_only_refreshes_its_own_section() {
+        let mut harness = Harness::gpg_loaded();
+        let external = External::Gpg {
+            action: GpgAction::Edit,
+            fingerprint: Some("FPR0".into()),
+        };
+        harness
+            .app
+            .on_external_done(&external, Ok("gpg done".into()));
+
+        assert_eq!(
+            harness.gpg_requests(),
+            vec![GpgRequest::ListKeys {
+                filter: GpgFilter::All
+            }]
+        );
+        assert!(harness.ssh_requests().is_empty());
+        assert!(harness.secrets_requests().is_empty());
     }
 
     #[test]
@@ -1123,6 +1443,214 @@ mod tests {
             "status was {:?}",
             harness.app.status
         );
+    }
+
+    // --- GPG keys --------------------------------------------------------
+
+    #[test]
+    fn the_gpg_section_reads_the_keyring_on_first_visit_only() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('2'));
+        assert_eq!(
+            harness.gpg_requests(),
+            vec![GpgRequest::ListKeys {
+                filter: GpgFilter::All
+            }]
+        );
+
+        harness.app.on_reply(Reply::GpgKeys {
+            keys: vec![gpg_key(0, "Me <me@example>", true)],
+            filter: GpgFilter::All,
+            engine: "gpg 2.4.9".into(),
+        });
+
+        harness.press(KeyCode::Char('1'));
+        harness.press(KeyCode::Char('2'));
+        assert!(
+            harness.gpg_requests().is_empty(),
+            "a revisit must not re-read"
+        );
+        assert!(harness.app.status.contains("gpg 2.4.9"));
+    }
+
+    #[test]
+    fn editing_runs_gpg_edit_key_on_the_selected_key() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('j')); // Them
+        harness.press(KeyCode::Char('e'));
+
+        let external = harness.app.take_external().expect("external parked");
+        assert_eq!(external.program(), "gpg");
+        assert_eq!(external.describe(), "gpg --edit-key FPR1");
+        assert_eq!(external.refresh(), Refresh::GpgKeys);
+    }
+
+    #[test]
+    fn exporting_prints_an_armoured_key() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('y'));
+
+        let external = harness.app.take_external().expect("external parked");
+        assert_eq!(external.describe(), "gpg --armor --export FPR0");
+    }
+
+    #[test]
+    fn generating_needs_no_prompt_because_gpg_asks() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('n'));
+
+        assert!(harness.app.prompt.is_none());
+        let external = harness.app.take_external().expect("external parked");
+        assert_eq!(external.describe(), "gpg --full-generate-key");
+    }
+
+    #[test]
+    fn deleting_asks_first_and_then_runs_gpg() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('x'));
+
+        assert_eq!(harness.app.prompt, Some(Prompt::ConfirmGpgDelete));
+        assert!(harness.app.take_external().is_none(), "not without a yes");
+
+        harness.press(KeyCode::Char('y'));
+        assert_eq!(harness.app.prompt, None);
+        let external = harness.app.take_external().expect("external parked");
+        assert_eq!(external.describe(), "gpg --delete-key FPR0");
+    }
+
+    #[test]
+    fn declining_a_delete_does_nothing() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('x'));
+        harness.press(KeyCode::Char('n'));
+
+        assert_eq!(harness.app.prompt, None);
+        assert!(harness.app.take_external().is_none());
+        assert_eq!(harness.app.status, "cancelled");
+    }
+
+    #[test]
+    fn publishing_asks_first_because_keyservers_do_not_forget() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('p'));
+
+        assert_eq!(harness.app.prompt, Some(Prompt::ConfirmGpgPublish));
+        assert!(harness.app.take_external().is_none());
+
+        harness.press(KeyCode::Esc);
+        assert_eq!(harness.app.prompt, None);
+        assert!(
+            harness.app.take_external().is_none(),
+            "Esc must not publish"
+        );
+        assert!(!harness.app.should_quit);
+    }
+
+    #[test]
+    fn a_confirmation_is_not_offered_without_a_selected_key() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('2'));
+        harness.app.on_reply(Reply::GpgKeys {
+            keys: Vec::new(),
+            filter: GpgFilter::All,
+            engine: "gpg 2.4.9".into(),
+        });
+
+        harness.press(KeyCode::Char('x'));
+        assert!(harness.app.prompt.is_none());
+        harness.press(KeyCode::Char('p'));
+        assert!(harness.app.prompt.is_none());
+    }
+
+    #[test]
+    fn the_filter_toggle_re_reads_with_the_new_filter() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('f'));
+
+        assert_eq!(harness.app.gpg_filter, GpgFilter::Secret);
+        assert_eq!(
+            harness.gpg_requests(),
+            vec![GpgRequest::ListKeys {
+                filter: GpgFilter::Secret
+            }]
+        );
+    }
+
+    #[test]
+    fn a_listing_for_a_superseded_filter_is_dropped() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('f')); // now expecting Secret
+        harness.drain();
+
+        harness.app.on_reply(Reply::GpgKeys {
+            keys: vec![gpg_key(0, "Stale <stale@example>", false)],
+            filter: GpgFilter::All,
+            engine: "gpg 2.4.9".into(),
+        });
+        assert_eq!(
+            harness.app.gpg_keys.len(),
+            2,
+            "the pre-toggle listing should still be on screen"
+        );
+
+        harness.app.on_reply(Reply::GpgKeys {
+            keys: vec![gpg_key(0, "Me <me@example>", true)],
+            filter: GpgFilter::Secret,
+            engine: "gpg 2.4.9".into(),
+        });
+        assert_eq!(harness.app.gpg_keys.len(), 1);
+    }
+
+    #[test]
+    fn a_re_read_keeps_the_cursor_on_the_same_key_by_fingerprint() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('j')); // FPR1
+
+        harness.app.on_reply(Reply::GpgKeys {
+            keys: vec![
+                gpg_key(0, "New <new@example>", true),
+                gpg_key(1, "Me <me@example>", true),
+                gpg_key(2, "Them <them@example>", false),
+            ],
+            filter: GpgFilter::All,
+            engine: "gpg 2.4.9".into(),
+        });
+        assert_eq!(
+            harness.app.selected_gpg_key().map(|key| key.id),
+            Some(1),
+            "FPR1 moved to index 1 and the cursor should have followed"
+        );
+    }
+
+    #[test]
+    fn gpg_bindings_do_nothing_in_the_other_sections() {
+        let mut harness = Harness::ssh_loaded();
+        for code in [
+            KeyCode::Char('e'),
+            KeyCode::Char('y'),
+            KeyCode::Char('p'),
+            KeyCode::Char('f'),
+        ] {
+            harness.press(code);
+        }
+        assert!(harness.app.take_external().is_none());
+        assert!(harness.app.prompt.is_none());
+        assert!(harness.gpg_requests().is_empty());
+    }
+
+    #[test]
+    fn x_removes_from_the_agent_in_ssh_but_deletes_in_gpg() {
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('x'));
+        assert_eq!(
+            harness.ssh_requests(),
+            vec![SshRequest::RemoveFromAgent { key: 0 }]
+        );
+        assert!(harness.app.prompt.is_none());
+
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('x'));
+        assert_eq!(harness.app.prompt, Some(Prompt::ConfirmGpgDelete));
     }
 
     // --- Shared chrome ---------------------------------------------------

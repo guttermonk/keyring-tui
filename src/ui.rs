@@ -23,14 +23,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match app.section {
         Section::Keyrings => draw_keyrings(frame, body_area, app),
-        Section::GpgKeys => draw_placeholder(frame, body_area, GPG_ROADMAP),
+        Section::GpgKeys => draw_gpg_keys(frame, body_area, app),
         Section::SshKeys => draw_ssh_keys(frame, body_area, app),
     }
 
     draw_status(frame, status_area, app);
 
     if let Some(prompt) = app.prompt {
-        draw_prompt(frame, frame.area(), prompt);
+        draw_prompt(frame, frame.area(), app, prompt);
     }
     if app.show_help {
         draw_help(frame, frame.area());
@@ -296,20 +296,189 @@ fn draw_ssh_detail(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(detail, area);
 }
 
-fn draw_placeholder(frame: &mut Frame, area: Rect, body: &str) {
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "Not implemented yet.",
-            Style::default().fg(Color::Yellow).bold(),
-        )),
-        Line::raw(""),
-    ];
-    lines.extend(body.lines().map(Line::raw));
+fn draw_gpg_keys(frame: &mut Frame, area: Rect, app: &mut App) {
+    let [left, right] =
+        Layout::horizontal([Constraint::Length(44), Constraint::Min(30)]).areas(area);
 
-    let paragraph = Paragraph::new(Text::from(lines))
+    let rows: Vec<ListItem> = app
+        .gpg_keys
+        .iter()
+        .map(|key| {
+            let mut spans = vec![Span::raw(key.primary_uid.clone())];
+            if key.has_secret {
+                spans.push(Span::styled(" [sec]", Style::default().fg(Color::Green)));
+            }
+            if key.on_card {
+                spans.push(Span::styled(" [card]", Style::default().fg(ACCENT)));
+            }
+            if let Some(state) = key.state() {
+                spans.push(Span::styled(
+                    format!(" [{state}]"),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let title = if app.gpg_ready() {
+        format!("Keys — {}", app.gpg_filter.describe())
+    } else {
+        "Keys — reading…".to_string()
+    };
+    let keys = List::new(rows)
+        .block(pane_block(&title, true))
+        .highlight_symbol("▌")
+        .highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .bg(Color::DarkGray),
+        );
+    frame.render_stateful_widget(keys, left, &mut app.gpg_state);
+
+    draw_gpg_detail(frame, right, app);
+}
+
+fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(key) = app.selected_gpg_key() else {
+        let message = if app.gpg_ready() {
+            match app.gpg_filter {
+                crate::model::GpgFilter::Secret => "No keys with a private half.",
+                crate::model::GpgFilter::All => "No keys in the GnuPG keyring.",
+            }
+        } else {
+            "Reading the GnuPG keyring…"
+        };
+        let hint = Paragraph::new(message)
+            .style(Style::default().dim())
+            .block(pane_block("Details", false));
+        frame.render_widget(hint, area);
+        return;
+    };
+
+    let mut lines = vec![
+        field("Key ID", &key.key_id),
+        field("Fingerprint", &group_fingerprint(&key.fingerprint)),
+        field("Algorithm", &key.algorithm),
+        field("Created", &format_timestamp(key.created)),
+        field(
+            "Expires",
+            &match key.expires {
+                Some(expires) => format_timestamp(Some(expires)),
+                None => "never".into(),
+            },
+        ),
+        field("Owner trust", key.owner_trust),
+        field("Capabilities", &describe_capabilities(&key.capabilities)),
+        field(
+            "Private key",
+            if key.has_secret {
+                "present in this keyring"
+            } else {
+                "not held"
+            },
+        ),
+    ];
+
+    if let Some(state) = key.state() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<12}", "State"), Style::default().dim()),
+            Span::styled(state.to_string(), Style::default().fg(Color::Yellow)),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "User IDs",
+        Style::default().fg(ACCENT),
+    )));
+    for uid in &key.uids {
+        let mut spans = vec![
+            Span::styled("  ", Style::default()),
+            Span::raw(uid.uid.clone()),
+            Span::styled(format!("  ({})", uid.validity), Style::default().dim()),
+        ];
+        if uid.revoked {
+            spans.push(Span::styled(
+                " [revoked]",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Subkeys",
+        Style::default().fg(ACCENT),
+    )));
+    for subkey in &key.subkeys {
+        let mut spans = vec![
+            Span::styled("  ", Style::default()),
+            Span::raw(subkey.key_id.clone()),
+            Span::styled(
+                format!(
+                    "  {}  [{}]  {}",
+                    subkey.algorithm,
+                    subkey.capabilities,
+                    format_timestamp(subkey.created)
+                ),
+                Style::default().dim(),
+            ),
+        ];
+        if subkey.on_card {
+            spans.push(Span::styled(" [card]", Style::default().fg(ACCENT)));
+        }
+        if subkey.revoked {
+            spans.push(Span::styled(
+                " [revoked]",
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if subkey.expired {
+            spans.push(Span::styled(
+                " [expired]",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let detail = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
-        .block(pane_block("Roadmap", false));
-    frame.render_widget(paragraph, area);
+        .block(pane_block("Details", false));
+    frame.render_widget(detail, area);
+}
+
+/// Spell out gpg's capability letters, which are otherwise folklore.
+fn describe_capabilities(letters: &str) -> String {
+    if letters.is_empty() {
+        return "none".into();
+    }
+    let names: Vec<&str> = letters
+        .chars()
+        .filter_map(|letter| match letter {
+            's' => Some("sign"),
+            'c' => Some("certify"),
+            'e' => Some("encrypt"),
+            'a' => Some("authenticate"),
+            _ => None,
+        })
+        .collect();
+    format!("{letters}  ({})", names.join(", "))
+}
+
+/// Fingerprints are read aloud and compared by eye, so group them the way gpg
+/// does rather than printing 40 unbroken characters.
+fn group_fingerprint(fingerprint: &str) -> String {
+    if fingerprint.len() != 40 {
+        return fingerprint.to_owned();
+    }
+    fingerprint
+        .as_bytes()
+        .chunks(4)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -317,7 +486,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let hints = match app.section {
         Section::Keyrings => "j/k move  u unlock  s secret  ? help ",
         Section::SshKeys => "j/k move  a add  x remove  n new  ? help ",
-        Section::GpgKeys => "? help ",
+        Section::GpgKeys => "j/k move  e edit  y export  n new  ? help ",
     };
     let [message_area, keys_area] = Layout::horizontal([
         Constraint::Min(10),
@@ -339,13 +508,28 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(keys, keys_area);
 }
 
-fn draw_prompt(frame: &mut Frame, area: Rect, prompt: Prompt) {
+fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt) {
+    // Confirmations name the key they are about, so there is no doubt which
+    // one is about to be deleted or published.
+    let subject = app
+        .selected_gpg_key()
+        .map(|key| format!("{}\n{}", key.primary_uid, key.key_id))
+        .unwrap_or_default();
+
     let (title, body) = match prompt {
-        Prompt::NewSshKey => (" New SSH key ", NEW_SSH_KEY_PROMPT),
+        Prompt::NewSshKey => (" New SSH key ".to_string(), NEW_SSH_KEY_PROMPT.to_string()),
+        Prompt::ConfirmGpgDelete => (
+            " Delete key ".to_string(),
+            format!("{subject}\n\n{DELETE_GPG_KEY_PROMPT}"),
+        ),
+        Prompt::ConfirmGpgPublish => (
+            " Publish key ".to_string(),
+            format!("{subject}\n\n{PUBLISH_GPG_KEY_PROMPT}"),
+        ),
     };
 
     let lines: Vec<Line> = body.lines().map(annotate_key).collect();
-    let popup = centered(area, 58, lines.len() as u16 + 2);
+    let popup = centered(area, 62, lines.len() as u16 + 2);
     frame.render_widget(Clear, popup);
 
     let widget = Paragraph::new(Text::from(lines)).block(
@@ -430,6 +614,14 @@ SSH keys
 a  add to the agent (runs ssh-add)
 x  remove from the agent
 n  new key (runs ssh-keygen)
+
+GPG keys
+e  edit: trust, expiry, UIDs, revoke, certify
+y  print the armoured public key
+n  new key (runs gpg --full-generate-key)
+p  publish to a keyserver
+x  delete the key
+f  show all keys / only secret keys
 ";
 
 const NEW_SSH_KEY_PROMPT: &str = "\
@@ -441,15 +633,20 @@ ssh-keygen will ask for the path and passphrase.
 Esc  cancel
 ";
 
-const GPG_ROADMAP: &str = "\
-Planned, via gpgme against the real ~/.gnupg (passphrases stay in gpg-agent):
+const DELETE_GPG_KEY_PROMPT: &str = "\
+Runs gpg --delete-key, which asks again. A key whose private
+half you hold is refused, as gpg wants --delete-secret-keys.
 
-  • list secret and public keys, with trust, expiry and capabilities
-  • key details: UIDs, subkeys, fingerprint, algorithm
-  • generate, import, export
-  • sign (certify) a key, set owner trust
-  • change expiry, revoke UID or key
-  • keyserver search, receive, publish
+y  delete
+Esc  cancel
+";
+
+const PUBLISH_GPG_KEY_PROMPT: &str = "\
+Runs gpg --send-keys. Keyservers do not forget: a published
+key, and every user ID on it, stays public.
+
+y  publish
+Esc  cancel
 ";
 
 #[cfg(test)]
@@ -462,7 +659,9 @@ mod tests {
 
     use super::*;
     use crate::backend::Reply;
-    use crate::model::{AgentStatus, ItemInfo, KeyringInfo, SshKeyInfo};
+    use crate::model::{
+        AgentStatus, GpgFilter, GpgKeyInfo, GpgSubkey, GpgUid, ItemInfo, KeyringInfo, SshKeyInfo,
+    };
 
     /// The rendered screen as one string per row, joined — enough to assert
     /// that a label is present without pinning the exact layout.
@@ -485,9 +684,10 @@ mod tests {
     fn app() -> App {
         let (secrets, _secrets_rx) = mpsc::unbounded_channel();
         let (ssh, _ssh_rx) = mpsc::unbounded_channel();
+        let (gpg, _gpg_rx) = mpsc::unbounded_channel();
         // The receivers are dropped, so requests go nowhere: these tests only
         // care about what a given state renders as.
-        App::new(secrets, ssh)
+        App::new(secrets, ssh, gpg)
     }
 
     fn ssh_key(name: &str, in_agent: bool) -> SshKeyInfo {
@@ -578,6 +778,118 @@ mod tests {
         });
         let screen = render(&mut app);
         assert!(screen.contains("hunter2"), "{screen}");
+    }
+
+    #[test]
+    fn a_gpg_key_renders_its_uids_subkeys_and_grouped_fingerprint() {
+        let mut app = app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        app.on_reply(Reply::GpgKeys {
+            keys: vec![GpgKeyInfo {
+                id: 0,
+                key_id: "A9F0DB57379512B0".into(),
+                fingerprint: "A9F0DB57379512B0DFBFA6CDE18D94492C20F0FC".into(),
+                primary_uid: "Greg <greg@example>".into(),
+                uids: vec![GpgUid {
+                    uid: "Greg <greg@example>".into(),
+                    validity: "ultimate",
+                    revoked: false,
+                }],
+                subkeys: vec![GpgSubkey {
+                    key_id: "DEADBEEFCAFE0001".into(),
+                    algorithm: "cv25519".into(),
+                    created: None,
+                    expires: None,
+                    capabilities: "e".into(),
+                    revoked: false,
+                    expired: false,
+                    has_secret: true,
+                    on_card: true,
+                }],
+                algorithm: "ed25519".into(),
+                created: None,
+                expires: None,
+                owner_trust: "ultimate",
+                has_secret: true,
+                revoked: false,
+                expired: false,
+                disabled: false,
+                capabilities: "sc".into(),
+                on_card: true,
+            }],
+            filter: GpgFilter::All,
+            engine: "gpg 2.4.9".into(),
+        });
+
+        let screen = render(&mut app);
+        assert!(screen.contains("Greg <greg@example>"), "{screen}");
+        assert!(screen.contains("[sec]"), "{screen}");
+        assert!(screen.contains("[card]"), "{screen}");
+        assert!(
+            screen.contains("A9F0 DB57 3795 12B0"),
+            "fingerprint should be grouped:\n{screen}"
+        );
+        assert!(
+            screen.contains("sc  (sign, certify)"),
+            "capabilities should be spelled out:\n{screen}"
+        );
+        assert!(
+            screen.contains("never"),
+            "expiry should read never:\n{screen}"
+        );
+        assert!(screen.contains("DEADBEEFCAFE0001"), "{screen}");
+        assert!(screen.contains("cv25519"), "{screen}");
+    }
+
+    #[test]
+    fn a_delete_confirmation_names_the_key() {
+        let mut app = app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        app.on_reply(Reply::GpgKeys {
+            keys: vec![gpg_key("Greg <greg@example>")],
+            filter: GpgFilter::All,
+            engine: "gpg 2.4.9".into(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        let screen = render(&mut app);
+        assert!(screen.contains("Delete key"), "{screen}");
+        assert!(
+            screen.contains("Greg <greg@example>"),
+            "the modal must name the key:\n{screen}"
+        );
+        assert!(screen.contains("delete-secret-key"), "{screen}");
+    }
+
+    #[test]
+    fn the_gpg_section_says_it_is_reading_before_the_first_reply() {
+        let mut app = app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+
+        let screen = render(&mut app);
+        assert!(screen.contains("reading"), "{screen}");
+        assert!(!screen.contains("No keys in the GnuPG keyring"), "{screen}");
+    }
+
+    fn gpg_key(uid: &str) -> GpgKeyInfo {
+        GpgKeyInfo {
+            id: 0,
+            key_id: "A9F0DB57379512B0".into(),
+            fingerprint: "A9F0DB57379512B0DFBFA6CDE18D94492C20F0FC".into(),
+            primary_uid: uid.into(),
+            uids: Vec::new(),
+            subkeys: Vec::new(),
+            algorithm: "ed25519".into(),
+            created: None,
+            expires: None,
+            owner_trust: "ultimate",
+            has_secret: true,
+            revoked: false,
+            expired: false,
+            disabled: false,
+            capabilities: "sc".into(),
+            on_card: false,
+        }
     }
 
     #[test]
