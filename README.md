@@ -108,6 +108,44 @@ terminal shows through. The slots are `fg`, `bg`, `dim`, `border`,
 `border_focused`, `cursor_fg`/`bg`, `status_fg`/`bg`, `accent`, `ok`, `warn`,
 `danger` and `secret`.
 
+It is also the only preset that works on a *light* terminal, because it makes
+`dim` and `border` the terminal's own foreground plus the DIM attribute rather
+than a colour. No colour can be quiet on both light and dark backgrounds: ANSI
+8 is the usual choice and measures about 1.05:1 against the background on a
+light theme, where anything under ~3:1 is unreadable, and ANSI 7 is what
+`reset` already resolves to. Naming an explicit `dim` or `border` colour
+replaces the attribute.
+
+Colour names are normalised the way ratatui normalises its own, so a value
+copied from another ratatui app means the same thing here — `bright-red`,
+`brightred`, `light_red` and `lightred` are one spelling. Two words are
+rejected rather than guessed at, being the only ones where the vocabularies
+disagreed *silently*: `white` (ANSI 15 to ratatui, ANSI 7 here — write
+`bright-white` or `gray`) and `bright-gray` (folded to ANSI 15 by ratatui
+despite the name).
+
+**Colour overlay.** An optional second file, layered over `[theme.colors]`,
+for tools that recolour a desktop from the wallpaper — wallust, pywal — which
+re-derive a palette on every wallpaper change and shouldn't own the file that
+also holds your keymap:
+
+| | |
+| --- | --- |
+| Path | `$XDG_CACHE_HOME/wallust/colors-keyring-tui.toml`, else `~/.cache/wallust/…`; `$KEYRING_TUI_COLORS_OVERLAY` overrides |
+| Shape | a **top-level** `[colors]` table, not `[theme.colors]` |
+| Merge | per key over `[theme.colors]`; `[theme]` is created if absent |
+| Absent | missing, unreadable or malformed means "use the config", silently |
+| Typos | a key that isn't a slot is dropped and reported, not rejected |
+| Reload | none — config is read once, so a new overlay applies next run |
+
+A typo in *this* file still fails at load, because you wrote it and can fix
+it; the overlay is machine-written, and the same rule would let a wallpaper
+change stop a key manager from starting.
+
+```console
+keyring-tui theme         # every slot, its resolved value, and where it came from
+```
+
 **Keybindings.** Two modes (`main`, `prompt`), four tables each, applied in
 order: `base` replaces the defaults, `set` gives actions exactly these keys,
 `extra` layers keys on top, `unbind` vetoes. So to navigate with `n`/`e`/`i`/`o`
@@ -132,6 +170,7 @@ extra = [["NewSshKey", "N"], ["NewGpgKey", "N"], ["GpgEdit", "E"]]
 
 ```console
 keyring-tui keys          # what a config resolves to, and any action left unbound
+keyring-tui theme         # every colour slot, resolved, with its source
 ```
 
 The format deliberately matches [lazysync](https://github.com/guttermonk/lazysync)'s,

@@ -79,7 +79,7 @@ fn draw_keyrings(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
         .map(|keyring| {
             let mut spans = vec![Span::raw(keyring.label.clone())];
             if keyring.is_default {
-                spans.push(Span::styled(" (default)", Style::default().fg(p.dim)));
+                spans.push(Span::styled(" (default)", p.dim_style()));
             }
             if keyring.locked {
                 spans.push(Span::styled(" [locked]", Style::default().fg(p.warn)));
@@ -108,10 +108,7 @@ fn draw_keyrings(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
             if item.locked {
                 spans.push(Span::styled(" [locked]", Style::default().fg(p.warn)));
             }
-            spans.push(Span::styled(
-                format!("  {}", item.kind()),
-                Style::default().fg(p.dim),
-            ));
+            spans.push(Span::styled(format!("  {}", item.kind()), p.dim_style()));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -137,7 +134,7 @@ fn draw_keyrings(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
 fn draw_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     let Some(item) = app.selected_item() else {
         let hint = Paragraph::new("No item selected.")
-            .style(Style::default().fg(p.dim))
+            .style(p.dim_style())
             .block(pane_block("Details", app.pane == Pane::Details, p));
         frame.render_widget(hint, area);
         return;
@@ -161,10 +158,10 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
         None => "•••••••••".to_string(),
     };
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<12}", "Secret"), Style::default().fg(p.dim)),
+        Span::styled(format!("{:<12}", "Secret"), p.dim_style()),
         match &app.revealed {
             Some(secret) => Span::styled(secret.to_string(), Style::default().fg(p.secret).bold()),
-            None => Span::styled(reveal_hint, Style::default().fg(p.dim)),
+            None => Span::styled(reveal_hint, p.dim_style()),
         },
     ]));
 
@@ -176,7 +173,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
         )));
         for (key, value) in &item.attributes {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key}: "), Style::default().fg(p.dim)),
+                Span::styled(format!("  {key}: "), p.dim_style()),
                 Span::raw(value.clone()),
             ]));
         }
@@ -216,7 +213,7 @@ fn draw_ssh_keys(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
             if key.hardware_backed {
                 spans.push(Span::styled(" [sk]", Style::default().fg(p.accent)));
             } else if key.encrypted {
-                spans.push(Span::styled(" [enc]", Style::default().fg(p.dim)));
+                spans.push(Span::styled(" [enc]", p.dim_style()));
             }
             ListItem::new(Line::from(spans))
         })
@@ -251,7 +248,7 @@ fn draw_ssh_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
             "Scanning ~/.ssh…"
         };
         let hint = Paragraph::new(message)
-            .style(Style::default().fg(p.dim))
+            .style(p.dim_style())
             .block(pane_block("Details", app.pane == Pane::Details, p));
         frame.render_widget(hint, area);
         return;
@@ -279,20 +276,20 @@ fn draw_ssh_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     ];
 
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<12}", "In agent"), Style::default().fg(p.dim)),
+        Span::styled(format!("{:<12}", "In agent"), p.dim_style()),
         match (key.in_agent, key.is_addable()) {
             (true, _) => Span::styled("yes", Style::default().fg(p.ok)),
-            (false, true) => Span::styled("no  (a to add)", Style::default().fg(p.dim)),
+            (false, true) => Span::styled("no  (a to add)", p.dim_style()),
             // No private key file, so ssh-add has nothing to work with.
-            (false, false) => Span::styled("no", Style::default().fg(p.dim)),
+            (false, false) => Span::styled("no", p.dim_style()),
         },
     ]));
 
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<12}", "Private key"), Style::default().fg(p.dim)),
+        Span::styled(format!("{:<12}", "Private key"), p.dim_style()),
         match key.private_path() {
             Some(path) => Span::raw(path.display().to_string()),
-            None => Span::styled("none on disk", Style::default().fg(p.dim)),
+            None => Span::styled("none on disk", p.dim_style()),
         },
     ]));
     if key.private_path().is_some() {
@@ -391,7 +388,7 @@ fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
             "Reading the GnuPG keyring…"
         };
         let hint = Paragraph::new(message)
-            .style(Style::default().fg(p.dim))
+            .style(p.dim_style())
             .block(pane_block("Details", app.pane == Pane::Details, p));
         frame.render_widget(hint, area);
         return;
@@ -425,7 +422,7 @@ fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
 
     if let Some(state) = key.state() {
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<12}", "State"), Style::default().fg(p.dim)),
+            Span::styled(format!("{:<12}", "State"), p.dim_style()),
             Span::styled(state.to_string(), Style::default().fg(p.warn)),
         ]));
     }
@@ -439,7 +436,7 @@ fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
         let mut spans = vec![
             Span::styled("  ", Style::default()),
             Span::raw(uid.uid.clone()),
-            Span::styled(format!("  ({})", uid.validity), Style::default().fg(p.dim)),
+            Span::styled(format!("  ({})", uid.validity), p.dim_style()),
         ];
         if uid.revoked {
             spans.push(Span::styled(" [revoked]", Style::default().fg(p.warn)));
@@ -463,7 +460,7 @@ fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
                     subkey.capabilities,
                     format_timestamp(subkey.created)
                 ),
-                Style::default().fg(p.dim),
+                p.dim_style(),
             ),
         ];
         if subkey.on_card {
@@ -536,11 +533,11 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let bar = Style::default().fg(p.status_fg).bg(p.status_bg);
     let message = match &app.error {
         Some(error) => Span::styled(format!(" {error}"), Style::default().fg(p.fg).bg(p.danger)),
-        None => Span::styled(format!(" {}", app.status), Style::default().fg(p.dim)),
+        None => Span::styled(format!(" {}", app.status), p.dim_style()),
     };
     frame.render_widget(Paragraph::new(Line::from(message)).style(bar), message_area);
 
-    let keys = Paragraph::new(Line::from(Span::styled(hints, Style::default().fg(p.dim))))
+    let keys = Paragraph::new(Line::from(Span::styled(hints, p.dim_style())))
         .style(bar)
         .alignment(Alignment::Right);
     frame.render_widget(keys, keys_area);
@@ -725,24 +722,19 @@ fn annotate_key(line: &str, p: &Palette) -> Line<'static> {
             Span::styled(format!(" {keys:<10}"), Style::default().fg(p.accent).bold()),
             Span::raw(description.trim().to_string()),
         ]),
-        _ => Line::styled(line.to_string(), Style::default().fg(p.dim)),
+        _ => Line::styled(line.to_string(), p.dim_style()),
     }
 }
 
 fn pane_block(title: &str, focused: bool, p: &Palette) -> Block<'static> {
-    let border = if focused {
-        Style::default().fg(p.border_focused)
-    } else {
-        Style::default().fg(p.border)
-    };
     Block::bordered()
         .title(format!(" {title} "))
-        .border_style(border)
+        .border_style(p.border_style(focused))
 }
 
 fn field(name: &str, value: &str, p: &Palette) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{name:<12}"), Style::default().fg(p.dim)),
+        Span::styled(format!("{name:<12}"), p.dim_style()),
         Span::raw(value.to_string()),
     ])
 }

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// `[theme]`
@@ -58,6 +58,10 @@ pub enum Preset {
 ///
 /// A flat struct rather than a map, so a missing slot is a compile error
 /// instead of a black-on-black surprise at runtime.
+///
+/// Read `dim` and `border` through [`Palette::dim_style`] and
+/// [`Palette::border_style`] rather than directly: either may render as the
+/// terminal's own foreground plus the DIM attribute instead of as a colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     pub fg: Color,
@@ -86,6 +90,27 @@ pub struct Palette {
     /// A revealed secret. Deliberately loud: it is on screen, and should
     /// look like it.
     pub secret: Color,
+
+    /// Render `dim` as the default foreground with the terminal's DIM
+    /// attribute, rather than as the colour in `dim`.
+    ///
+    /// Set only by the `terminal` preset, and cleared the moment a config or
+    /// overlay names an explicit `dim` colour — a chosen colour should be
+    /// shown, not faded.
+    ///
+    /// This exists because a *colour* cannot be quiet on both a light and a
+    /// dark terminal. The obvious choice, ANSI 8, is "bright black": a
+    /// mid-grey on dark themes and all but invisible on light ones, measured
+    /// at 1.05:1 against the background on rose-pine-dawn where anything
+    /// under about 3:1 is unreadable. ANSI 7 is no escape either, since that
+    /// is what `reset` already resolves to, so the slot would do nothing. The
+    /// DIM attribute asks the terminal to fade whatever its own foreground
+    /// is, which is the only answer that works in both directions. A terminal
+    /// that ignores SGR 2 renders quiet text as normal text — legible but
+    /// unsubordinated, which is the right way to fail.
+    dim_faint: bool,
+    /// The same, for `border`.
+    border_faint: bool,
 }
 
 impl Palette {
@@ -108,7 +133,69 @@ impl Palette {
         "secret",
     ];
 
+    /// Secondary text: field labels, schemas, timestamps, hints.
+    pub fn dim_style(&self) -> Style {
+        Self::quiet(self.dim, self.dim_faint)
+    }
+
+    /// A pane border, which is quiet in the same way unless it has focus.
+    pub fn border_style(&self, focused: bool) -> Style {
+        if focused {
+            Style::default().fg(self.border_focused)
+        } else {
+            Self::quiet(self.border, self.border_faint)
+        }
+    }
+
+    /// The colour in a slot by name, for `keyring-tui theme`. `None` for a
+    /// name that is not a slot, so this cannot drift from [`Palette::set`].
+    pub fn slot(&self, slot: &str) -> Option<Color> {
+        Some(match slot {
+            "fg" => self.fg,
+            "bg" => self.bg,
+            "dim" => self.dim,
+            "border" => self.border,
+            "border_focused" => self.border_focused,
+            "cursor_fg" => self.cursor_fg,
+            "cursor_bg" => self.cursor_bg,
+            "status_fg" => self.status_fg,
+            "status_bg" => self.status_bg,
+            "accent" => self.accent,
+            "ok" => self.ok,
+            "warn" => self.warn,
+            "danger" => self.danger,
+            "secret" => self.secret,
+            _ => return None,
+        })
+    }
+
+    /// Whether a slot renders with the DIM attribute rather than as a colour.
+    pub fn is_faint(&self, slot: &str) -> bool {
+        match slot {
+            "dim" => self.dim_faint,
+            "border" => self.border_faint,
+            _ => false,
+        }
+    }
+
+    fn quiet(color: Color, faint: bool) -> Style {
+        let style = Style::default().fg(color);
+        if faint {
+            style.add_modifier(Modifier::DIM)
+        } else {
+            style
+        }
+    }
+
     fn set(&mut self, slot: &str, color: Color) -> Result<(), UnknownColorSlot> {
+        // An explicit colour replaces the attribute: the point of naming one
+        // is to see it, not to see it faded.
+        match slot {
+            "dim" => self.dim_faint = false,
+            "border" => self.border_faint = false,
+            _ => {}
+        }
+
         let target = match slot {
             "fg" => &mut self.fg,
             "bg" => &mut self.bg,
@@ -164,8 +251,11 @@ impl Preset {
                 // or themed terminal background show through.
                 fg: Color::Reset,
                 bg: Color::Reset,
-                dim: Color::DarkGray,
-                border: Color::DarkGray,
+                // Reset rather than DarkGray, with `dim_faint` below doing the
+                // quieting: ANSI 8 is invisible on a light terminal, and this
+                // is the preset that has to work on both.
+                dim: Color::Reset,
+                border: Color::Reset,
                 border_focused: Color::Cyan,
                 cursor_fg: Color::Black,
                 cursor_bg: Color::Cyan,
@@ -176,6 +266,10 @@ impl Preset {
                 warn: Color::Yellow,
                 danger: Color::Red,
                 secret: Color::LightRed,
+                // The only preset that cannot know the background: ask the
+                // terminal to fade its own foreground instead of guessing.
+                dim_faint: true,
+                border_faint: true,
             },
             Self::CatppuccinMocha => Palette {
                 fg: rgb(0xcdd6f4),
@@ -192,6 +286,8 @@ impl Preset {
                 warn: rgb(0xf9e2af),
                 danger: rgb(0xf38ba8),
                 secret: rgb(0xf38ba8),
+                dim_faint: false,
+                border_faint: false,
             },
             Self::GruvboxDark => Palette {
                 fg: rgb(0xebdbb2),
@@ -208,6 +304,8 @@ impl Preset {
                 warn: rgb(0xfe8019),
                 danger: rgb(0xfb4934),
                 secret: rgb(0xfb4934),
+                dim_faint: false,
+                border_faint: false,
             },
             Self::Nord => Palette {
                 fg: rgb(0xd8dee9),
@@ -224,6 +322,8 @@ impl Preset {
                 warn: rgb(0xebcb8b),
                 danger: rgb(0xbf616a),
                 secret: rgb(0xbf616a),
+                dim_faint: false,
+                border_faint: false,
             },
         }
     }
@@ -299,7 +399,17 @@ fn parse_color(raw: &str) -> Result<Color, String> {
         return Ok(rgb(value));
     }
 
-    Ok(match raw.to_ascii_lowercase().replace('_', "-").as_str() {
+    // Normalised the way ratatui's own `Color::from_str` does — lower-cased,
+    // separators dropped, `bright` folded to `light` — so a value copied from
+    // any other ratatui app's config means here what it means there.
+    // `bright-red`, `brightred`, `light_red` and `lightred` are one spelling.
+    let name = raw
+        .to_ascii_lowercase()
+        .replace([' ', '-', '_'], "")
+        .replace("bright", "light")
+        .replace("grey", "gray");
+
+    Ok(match name.as_str() {
         "reset" | "default" => Color::Reset,
         "black" => Color::Black,
         "red" => Color::Red,
@@ -308,15 +418,41 @@ fn parse_color(raw: &str) -> Result<Color, String> {
         "blue" => Color::Blue,
         "magenta" => Color::Magenta,
         "cyan" => Color::Cyan,
-        "gray" | "grey" | "white" => Color::Gray,
-        "dark-gray" | "dark-grey" => Color::DarkGray,
-        "bright-red" => Color::LightRed,
-        "bright-green" => Color::LightGreen,
-        "bright-yellow" => Color::LightYellow,
-        "bright-blue" => Color::LightBlue,
-        "bright-magenta" => Color::LightMagenta,
-        "bright-cyan" => Color::LightCyan,
-        "bright-white" => Color::White,
+        "gray" | "silver" => Color::Gray,
+        "darkgray" | "lightblack" => Color::DarkGray,
+        "lightred" => Color::LightRed,
+        "lightgreen" => Color::LightGreen,
+        "lightyellow" => Color::LightYellow,
+        "lightblue" => Color::LightBlue,
+        "lightmagenta" => Color::LightMagenta,
+        "lightcyan" => Color::LightCyan,
+        "lightwhite" => Color::White,
+
+        // Rejected rather than guessed: ratatui reads "white" as ANSI 15, and
+        // this file used to read it as ANSI 7. Both are defensible and the
+        // disagreement was silent — the one word a reader is surest about was
+        // the one that quietly gave the other colour. Every other word either
+        // agrees with ratatui or fails loudly, so this is the only place the
+        // vocabulary could mislead, and an error naming both answers costs a
+        // config edit instead of a wrong colour nobody notices.
+        "white" => {
+            return Err(
+                "colour \"white\" is ambiguous: write \"gray\" for ANSI 7, the colour \
+                 \"reset\" also resolves to, or \"bright-white\" for ANSI 15, which is what \
+                 ratatui calls \"white\""
+                    .to_string(),
+            );
+        }
+        // ratatui folds these to ANSI 15, which is surprising enough that
+        // taking the name at face value would be its own silent disagreement.
+        "lightgray" => {
+            return Err(
+                "colour \"bright-gray\" is ambiguous: write \"bright-white\" for ANSI 15, \
+                 which is what ratatui resolves it to, or \"dark-gray\" for ANSI 8"
+                    .to_string(),
+            );
+        }
+
         other => {
             return Err(format!(
                 "unknown colour {other:?} (expected a hex value like \"#89b4fa\", or an ANSI \
@@ -373,6 +509,91 @@ mod tests {
         assert_eq!(palette.danger, Color::LightRed);
         // Untouched slots keep the preset's value.
         assert_eq!(palette.accent, rgb(0x88c0d0));
+    }
+
+    #[test]
+    fn the_terminal_preset_is_quiet_by_attribute_not_by_colour() {
+        // ANSI 8 is invisible on a light terminal, so the default preset asks
+        // the terminal to fade its own foreground instead.
+        let palette = Theme::default().palette().unwrap();
+        assert_eq!(palette.dim, Color::Reset);
+        assert_eq!(palette.border, Color::Reset);
+        assert!(palette.dim_style().add_modifier.contains(Modifier::DIM));
+        assert!(
+            palette
+                .border_style(false)
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            !palette
+                .border_style(true)
+                .add_modifier
+                .contains(Modifier::DIM),
+            "a focused border is not meant to be quiet"
+        );
+    }
+
+    #[test]
+    fn an_explicit_colour_replaces_the_dim_attribute() {
+        let theme: Theme = toml::from_str("[colors]\ndim = \"blue\"").unwrap();
+        let palette = theme.palette().unwrap();
+
+        assert_eq!(palette.dim, Color::Blue);
+        assert!(
+            !palette.dim_style().add_modifier.contains(Modifier::DIM),
+            "a named colour should be shown, not faded"
+        );
+        assert!(
+            palette
+                .border_style(false)
+                .add_modifier
+                .contains(Modifier::DIM),
+            "and the other slot is unaffected"
+        );
+    }
+
+    #[test]
+    fn a_dark_preset_keeps_its_own_quiet_colour() {
+        let theme: Theme = toml::from_str("preset = \"nord\"").unwrap();
+        let palette = theme.palette().unwrap();
+        assert_eq!(palette.dim, rgb(0x616e88));
+        assert!(!palette.dim_style().add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn ratatui_spellings_are_accepted_for_the_bright_half() {
+        // A value copied from any other ratatui app's config should mean the
+        // same thing here. These four are one spelling.
+        for raw in ["bright-red", "brightred", "light_red", "lightred"] {
+            assert_eq!(parse_color(raw).unwrap(), Color::LightRed, "{raw}");
+        }
+        for raw in ["dark-gray", "darkgrey", "lightblack", "bright-black"] {
+            assert_eq!(parse_color(raw).unwrap(), Color::DarkGray, "{raw}");
+        }
+        assert_eq!(parse_color("silver").unwrap(), Color::Gray);
+        assert_eq!(parse_color("bright-white").unwrap(), Color::White);
+    }
+
+    #[test]
+    fn white_is_rejected_as_ambiguous() {
+        // The one word that parsed in both vocabularies and meant different
+        // colours: ANSI 15 to ratatui, ANSI 7 here. An error naming both is
+        // better than silently picking one.
+        let err = parse_color("white").unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("gray"), "{err}");
+        assert!(err.contains("bright-white"), "{err}");
+
+        // And the spelling ratatui folds to ANSI 15 despite saying "gray".
+        let err = parse_color("bright-gray").unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn the_unambiguous_greys_still_work() {
+        assert_eq!(parse_color("gray").unwrap(), Color::Gray);
+        assert_eq!(parse_color("grey").unwrap(), Color::Gray);
     }
 
     #[test]

@@ -18,10 +18,36 @@
 # terminal shows through. Also: "catppuccin-mocha", "gruvbox-dark", "nord".
 preset = "terminal"
 
+# "terminal" is also the only preset that works on a light terminal. It makes
+# `dim` and `border` the terminal's own foreground plus the DIM attribute,
+# rather than a colour: no *colour* can be quiet on both light and dark
+# backgrounds. ANSI 8 ("bright black") is the usual choice and measures 1.05:1
+# against the background on a light theme, where under ~3:1 is unreadable;
+# ANSI 7 is what "reset" already resolves to, so the slot would do nothing.
+# Naming an explicit `dim` or `border` colour below replaces the attribute —
+# a colour you chose should be shown, not faded.
+#
 # Individual colours can be overridden on top of the preset. Values are either
 # hex ("#89b4fa" or "0x89b4fa") or an ANSI name: reset, black, red, green,
 # yellow, blue, magenta, cyan, gray, dark-gray, and bright-red through
 # bright-white.
+#
+# Names are normalised the way ratatui normalises its own, so a value copied
+# from another ratatui app's config means the same thing here: case, spaces,
+# `-` and `_` are ignored and `bright` and `light` are the same word, making
+# "bright-red", "brightred", "light_red" and "lightred" one spelling.
+#
+# Two words are rejected rather than guessed at, because they are the only
+# ones where the two vocabularies disagreed *silently*:
+#
+#   "white"        ratatui reads it as ANSI 15, this file used to read it as
+#                  ANSI 7. Write "bright-white" or "gray".
+#   "bright-gray"  ratatui folds it to ANSI 15 despite the name. Write
+#                  "bright-white" or "dark-gray".
+#
+# Prefer an ANSI name to hex if you switch themes live: a terminal re-resolves
+# its palette when it is told to, so named colours follow the switch, while a
+# hex value stays as written until keyring-tui restarts.
 #
 # Slots:
 #
@@ -41,6 +67,48 @@ preset = "terminal"
 # border_focused = "#fabd2f"
 # secret = "bright-red"     # it is on screen; it should look like it
 # warn = "yellow"           # locked keyrings, expired keys
+
+# ─── The colour overlay ──────────────────────────────────────────────────────
+#
+# A second, optional colour file, layered over `[theme.colors]` above. It
+# exists for tools that recolour a desktop from the current wallpaper —
+# wallust, pywal — which re-derive a palette on every wallpaper change and
+# have no business owning the file that also holds your keymap.
+#
+# There is nothing to configure here: the file is written by that tool, and
+# this section documents the contract so one can be written to match.
+#
+#   Path    $XDG_CACHE_HOME/wallust/colors-keyring-tui.toml, falling back to
+#           ~/.cache/wallust/colors-keyring-tui.toml.
+#           $KEYRING_TUI_COLORS_OVERLAY overrides it outright.
+#
+#   Shape   a TOP-LEVEL [colors] table — not [theme.colors] — so every file in
+#           a wallust template directory has the same shape. Slot names and
+#           values are exactly as above:
+#
+#               [colors]
+#               dim    = "blue"
+#               border = "#5e81ac"
+#
+#   Merge   per key, over [theme.colors]. An overlay naming only `border`
+#           leaves the other thirteen slots as this file has them, and
+#           [theme] / [theme.colors] are created if this file omits them.
+#
+#   Absent  a missing, unreadable or malformed overlay means "use the config"
+#           and is silently nothing. That is the normal state: it is what
+#           every theme that is not wallpaper-derived wants.
+#
+#   Typos   a key that is not a colour slot is dropped, not rejected. This
+#           file failing loudly is right because you wrote it; the overlay is
+#           machine-written, and the same rule would let a wallpaper change
+#           stop a key manager from starting. `keyring-tui theme` names
+#           anything that was dropped.
+#
+#   Reload  none. keyring-tui reads its configuration once at startup, so a
+#           new overlay applies to the next run. No hook, no file watcher.
+#
+# Run `keyring-tui theme` to see the resolved result, which slot came from
+# where, and anything the overlay named that was ignored.
 
 # ─── Keybindings ─────────────────────────────────────────────────────────────
 #

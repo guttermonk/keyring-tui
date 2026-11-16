@@ -8,6 +8,7 @@ mod model;
 mod ui;
 
 use std::io;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -33,6 +34,7 @@ const USAGE: &str = concat!(
     "\n
 Usage: keyring-tui [options]
        keyring-tui keys [options]      print the resolved keymap and exit
+       keyring-tui theme [options]     print the resolved colours and exit
 
 Options:
   -c, --config <path>   config file (default: $XDG_CONFIG_HOME/keyring-tui/config.toml)
@@ -46,11 +48,13 @@ async fn main() -> Result<()> {
     // Two flags and one subcommand, so no argument parser.
     let mut config_path: Option<PathBuf> = None;
     let mut dump_keys = false;
+    let mut dump_theme = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "keys" => dump_keys = true,
+            "theme" => dump_theme = true,
             "-c" | "--config" => match args.next() {
                 Some(path) => config_path = Some(PathBuf::from(path)),
                 None => {
@@ -82,6 +86,10 @@ async fn main() -> Result<()> {
     let palette = settings.palette().wrap_err("failed to build the theme")?;
     let keymaps = settings.keymaps();
 
+    if dump_theme {
+        print_theme(&settings, &palette);
+        return Ok(());
+    }
     if dump_keys {
         print_keymap(&keymaps);
         return Ok(());
@@ -97,40 +105,127 @@ async fn main() -> Result<()> {
     outcome
 }
 
+/// Write a dump to stdout, stopping quietly if the reader goes away.
+///
+/// `println!` panics on EPIPE, and piping either dump into `head` is a normal
+/// thing to do — a panic with a backtrace is a poor answer to it.
+fn dump(lines: Vec<String>) {
+    let mut out = io::stdout().lock();
+    for line in lines {
+        if writeln!(out, "{line}").is_err() {
+            return;
+        }
+    }
+}
+
 /// What `keyring-tui keys` prints: the keymap a config resolves to, and any
 /// action a config has left with no key at all — which `base`, `set`, `extra`
 /// and `unbind` can all cause, and which is otherwise silent.
 fn print_keymap(keymaps: &keys::Keymaps) {
+    let mut lines = Vec::new();
     for (mode, map) in keymaps.iter() {
-        println!("[keys.{mode}]");
+        lines.push(format!("[keys.{mode}]"));
         for action in map.actions() {
             let combos: Vec<String> = map
                 .combos_for(action)
                 .into_iter()
                 .map(ToString::to_string)
                 .collect();
-            println!(
+            lines.push(format!(
                 "  {:<18} {:<24} {}",
                 action.to_string(),
                 combos.join(", "),
                 action.describe()
-            );
+            ));
         }
 
+        // Named after the table rather than left as a `-` in a column of
+        // thirty rows. An unbound action is the exact failure this subcommand
+        // exists to catch — `set` retires an action's keys silently, so this
+        // is how someone discovers that moving navigation onto `n` took `n`
+        // away from NewSshKey — and it is too easy to scroll past inline.
         let unreachable = keymaps.unreachable(mode);
         if !unreachable.is_empty() {
-            println!("  (no key bound):");
-            for action in unreachable {
-                println!(
+            for action in &unreachable {
+                lines.push(format!(
                     "  {:<18} {:<24} {}",
                     action.to_string(),
                     "-",
                     action.describe()
-                );
+                ));
+            }
+            lines.push(String::new());
+            lines.push(format!(
+                "  unreachable in {mode} — no key is bound to these:"
+            ));
+            for action in &unreachable {
+                lines.push(format!("    {}  ({})", action, action.describe()));
             }
         }
-        println!();
+        lines.push(String::new());
     }
+    dump(lines);
+}
+
+/// What `keyring-tui theme` prints: every slot, the colour it resolved to,
+/// and where that came from.
+///
+/// The counterpart to `keys`, and the way a generated palette is checked
+/// without starting the TUI and looking at it.
+fn print_theme(settings: &config::Config, palette: &config::theme::Palette) {
+    use config::theme::{ColorSpec, Palette};
+
+    let mut lines = vec!["[theme]".to_string()];
+    // Serialised, not `Debug`-printed, so the dump says `terminal` — the
+    // spelling a config would use — rather than `Terminal`.
+    let preset = toml::Value::try_from(settings.theme.preset)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{:?}", settings.theme.preset));
+    lines.push(format!("  preset = {preset:?}"));
+    lines.push(String::new());
+
+    let describe = |slot: &str| -> String {
+        let color = palette.slot(slot).expect("SLOTS and slot() agree");
+        // Serialised through ColorSpec so the printed word is one the config
+        // would accept back.
+        let name = toml::Value::try_from(ColorSpec(color))
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{color:?}"));
+
+        match (name.as_str(), palette.is_faint(slot)) {
+            // `reset` alone reads as "no colour set"; saying whose colour it
+            // is makes the dump answer the question being asked of it.
+            (_, true) => format!("{name} + dim attribute (the terminal's own, faded)"),
+            ("reset", false) => "reset (the terminal's own)".to_string(),
+            _ => name,
+        }
+    };
+
+    for slot in Palette::SLOTS {
+        let source = if settings.overlay_applied.iter().any(|key| key == slot) {
+            "  (overlay)"
+        } else if settings.theme.colors.contains_key(*slot) {
+            "  (config)"
+        } else {
+            ""
+        };
+        lines.push(format!("  {:<16} {}{}", slot, describe(slot), source));
+    }
+
+    // Named rather than left silent: the overlay is machine-written, so a
+    // producer's typo is dropped at load instead of refusing to start, and
+    // this is the only place it surfaces.
+    if !settings.overlay_ignored.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "  ignored in the colour overlay — not colour slots: {}",
+            settings.overlay_ignored.join(", ")
+        ));
+    }
+
+    dump(lines);
 }
 
 async fn run(
