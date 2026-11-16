@@ -2,10 +2,13 @@
 
 mod app;
 mod backend;
+mod config;
+mod keys;
 mod model;
 mod ui;
 
 use std::io;
+use std::path::PathBuf;
 use std::process::Command;
 
 use color_eyre::Result;
@@ -27,28 +30,61 @@ const USAGE: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\n",
     env!("CARGO_PKG_DESCRIPTION"),
-    "\n\nUsage: keyring-tui [--help] [--version]\n",
+    "\n
+Usage: keyring-tui [options]
+       keyring-tui keys [options]      print the resolved keymap and exit
+
+Options:
+  -c, --config <path>   config file (default: $XDG_CONFIG_HOME/keyring-tui/config.toml)
+  -h, --help
+  -V, --version
+",
 );
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // No options yet beyond the conventional two, so no argument parser.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        None => {}
-        Some("-h" | "--help") => {
-            print!("{USAGE}");
-            return Ok(());
+    // Two flags and one subcommand, so no argument parser.
+    let mut config_path: Option<PathBuf> = None;
+    let mut dump_keys = false;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "keys" => dump_keys = true,
+            "-c" | "--config" => match args.next() {
+                Some(path) => config_path = Some(PathBuf::from(path)),
+                None => {
+                    eprintln!("{arg} needs a path\n");
+                    print!("{USAGE}");
+                    std::process::exit(2);
+                }
+            },
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            other => {
+                eprintln!("unknown argument: {other}\n");
+                print!("{USAGE}");
+                std::process::exit(2);
+            }
         }
-        Some("-V" | "--version") => {
-            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-            return Ok(());
-        }
-        Some(other) => {
-            eprintln!("unknown argument: {other}\n");
-            print!("{USAGE}");
-            std::process::exit(2);
-        }
+    }
+
+    // A broken config is reported here, before the terminal is taken over,
+    // where the message can actually be read.
+    let settings = config::Config::load_default(config_path.as_deref())
+        .wrap_err("failed to load the configuration")?;
+    let palette = settings.palette().wrap_err("failed to build the theme")?;
+    let keymaps = settings.keymaps();
+
+    if dump_keys {
+        print_keymap(&keymaps);
+        return Ok(());
     }
 
     color_eyre::install()?;
@@ -56,22 +92,62 @@ async fn main() -> Result<()> {
     let terminal = ratatui::try_init().wrap_err("failed to set up the terminal")?;
     // Restore the terminal even if `run` returns an error or panics upstream of
     // the report being printed.
-    let outcome = run(terminal).await;
+    let outcome = run(terminal, palette, keymaps).await;
     ratatui::restore();
     outcome
 }
 
-async fn run(mut terminal: ratatui::DefaultTerminal) -> Result<()> {
+/// What `keyring-tui keys` prints: the keymap a config resolves to, and any
+/// action a config has left with no key at all — which `base`, `set`, `extra`
+/// and `unbind` can all cause, and which is otherwise silent.
+fn print_keymap(keymaps: &keys::Keymaps) {
+    for (mode, map) in keymaps.iter() {
+        println!("[keys.{mode}]");
+        for action in map.actions() {
+            let combos: Vec<String> = map
+                .combos_for(action)
+                .into_iter()
+                .map(ToString::to_string)
+                .collect();
+            println!(
+                "  {:<18} {:<24} {}",
+                action.to_string(),
+                combos.join(", "),
+                action.describe()
+            );
+        }
+
+        let unreachable = keymaps.unreachable(mode);
+        if !unreachable.is_empty() {
+            println!("  (no key bound):");
+            for action in unreachable {
+                println!(
+                    "  {:<18} {:<24} {}",
+                    action.to_string(),
+                    "-",
+                    action.describe()
+                );
+            }
+        }
+        println!();
+    }
+}
+
+async fn run(
+    mut terminal: ratatui::DefaultTerminal,
+    palette: config::theme::Palette,
+    keymaps: keys::Keymaps,
+) -> Result<()> {
     let (reply_tx, mut replies) = mpsc::unbounded_channel::<Reply>();
     let secrets = backend::secrets::spawn(reply_tx.clone());
     let ssh = backend::ssh::spawn(reply_tx.clone());
     let gpg = backend::gpg::spawn(reply_tx);
-    let mut app = App::new(secrets, ssh, gpg);
+    let mut app = App::new(secrets, ssh, gpg, keymaps);
 
     let mut input = EventStream::new();
 
     while !app.should_quit {
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        terminal.draw(|frame| ui::draw(frame, &mut app, &palette))?;
 
         // Redraw only when something happened — no polling, no idle wakeups.
         tokio::select! {

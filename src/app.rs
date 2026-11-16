@@ -8,21 +8,37 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
 
 use crate::backend::{GpgRequest, Refresh, Reply, SecretsRequest, SshRequest};
+use crate::keys::{Action, Keymaps, Mode, ModifiedKey, Resolution};
 use crate::model::{
     AgentStatus, GpgFilter, GpgKeyInfo, ItemInfo, KeyringInfo, Section, SshKeyInfo,
 };
 
-/// Which of the two list panes has the keyboard, in the Passwords section.
+/// Which pane has the keyboard. `h`/`l` walk this left to right.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pane {
+    /// The keyring sidebar. Passwords only.
     Keyrings,
-    Items,
+    /// The main list: items, SSH keys, or GPG keys.
+    List,
+    /// The detail pane, which scrolls with `j`/`k` once focused.
+    Details,
+}
+
+/// The panes a section has, in left-to-right order.
+///
+/// Only Passwords has a sidebar; the key sections put their list where the
+/// item list would be.
+pub fn panes_for(section: Section) -> &'static [Pane] {
+    match section {
+        Section::Keyrings => &[Pane::Keyrings, Pane::List, Pane::Details],
+        Section::GpgKeys | Section::SshKeys => &[Pane::List, Pane::Details],
+    }
 }
 
 /// A modal question. Only ever one at a time, and always dismissable.
@@ -170,6 +186,15 @@ pub struct App {
     /// The GPG section reads the keyring on first visit, not at startup.
     gpg_loaded: bool,
 
+    /// How far the detail pane is scrolled, and how many lines it last drew.
+    ///
+    /// The line count comes back from the renderer, which is the only place
+    /// that knows it; without it, `j` in a focused detail pane would scroll
+    /// happily past the end.
+    pub detail_scroll: u16,
+    pub detail_lines: u16,
+    pub detail_height: u16,
+
     pub status: String,
     pub error: Option<String>,
     pub show_help: bool,
@@ -177,6 +202,10 @@ pub struct App {
     pub should_quit: bool,
 
     external: Option<External>,
+
+    keymaps: Keymaps,
+    /// Keys pressed so far that have not yet completed a binding.
+    pending: Vec<ModifiedKey>,
 
     secrets: UnboundedSender<SecretsRequest>,
     ssh: UnboundedSender<SshRequest>,
@@ -188,6 +217,7 @@ impl App {
         secrets: UnboundedSender<SecretsRequest>,
         ssh: UnboundedSender<SshRequest>,
         gpg: UnboundedSender<GpgRequest>,
+        keymaps: Keymaps,
     ) -> Self {
         let app = Self {
             section: Section::Keyrings,
@@ -211,7 +241,12 @@ impl App {
             show_help: false,
             prompt: None,
             should_quit: false,
+            detail_scroll: 0,
+            detail_lines: 0,
+            detail_height: 0,
             external: None,
+            keymaps,
+            pending: Vec::new(),
             secrets,
             ssh,
             gpg,
@@ -295,107 +330,143 @@ impl App {
         }
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
-        // Windows sends both press and release; only act once.
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
+    /// The keymap in force, so the help overlay can show the user's own keys.
+    pub fn keymaps(&self) -> &Keymaps {
+        &self.keymaps
+    }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return;
-        }
-
-        // Help is modal: any key dismisses it.
-        if self.show_help {
-            self.show_help = false;
-            return;
-        }
-
-        // A prompt consumes the key, so an unrecognised press cannot fall
-        // through to a binding underneath it.
-        if let Some(prompt) = self.prompt {
-            self.handle_prompt_key(prompt, key.code);
-            return;
-        }
-
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('?') => self.show_help = true,
-
-            KeyCode::Tab => self.set_section(self.section.next()),
-            KeyCode::BackTab => self.set_section(self.section.prev()),
-            KeyCode::Char('1') => self.set_section(Section::Keyrings),
-            KeyCode::Char('2') => self.set_section(Section::GpgKeys),
-            KeyCode::Char('3') => self.set_section(Section::SshKeys),
-
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char('g') | KeyCode::Home => self.jump_selection(true),
-            KeyCode::Char('G') | KeyCode::End => self.jump_selection(false),
-
-            KeyCode::Char('r') => self.refresh(),
-
-            // Passwords only.
-            KeyCode::Char('h') | KeyCode::Left => self.focus(Pane::Keyrings),
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.focus(Pane::Items),
-            KeyCode::Char('u') => self.lock_selected(false),
-            KeyCode::Char('L') => self.lock_selected(true),
-            KeyCode::Char('s') => self.toggle_secret(),
-
-            // SSH only.
-            KeyCode::Char('a') => self.add_to_agent(),
-
-            // GPG only.
-            KeyCode::Char('e') => self.edit_gpg_key(),
-            KeyCode::Char('y') => self.export_gpg_key(),
-            KeyCode::Char('p') => self.confirm(Prompt::ConfirmGpgPublish),
-            KeyCode::Char('f') => self.toggle_gpg_filter(),
-
-            // Section-dependent: remove from the agent, or delete a GPG key.
-            KeyCode::Char('x') => match self.section {
-                Section::SshKeys => self.remove_from_agent(),
-                Section::GpgKeys => self.confirm(Prompt::ConfirmGpgDelete),
-                Section::Keyrings => {}
-            },
-            KeyCode::Char('n') => match self.section {
-                Section::SshKeys => self.prompt = Some(Prompt::NewSshKey),
-                // gpg --full-generate-key asks everything itself, so there is
-                // nothing for us to ask first.
-                Section::GpgKeys => self.run_gpg(GpgAction::Generate, None),
-                Section::Keyrings => {}
-            },
-
-            _ => {}
+    /// Which keymap a keypress is resolved against right now.
+    pub fn mode(&self) -> Mode {
+        if self.prompt.is_some() {
+            Mode::Prompt
+        } else {
+            Mode::Main
         }
     }
 
-    fn handle_prompt_key(&mut self, prompt: Prompt, code: KeyCode) {
-        let cancelled = matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n'));
+    pub fn handle_key(&mut self, event: KeyEvent) {
+        // Not a press (Windows sends releases too), or a key with no name in
+        // the config syntax.
+        let Some(pressed) = ModifiedKey::from_event(event) else {
+            return;
+        };
+
+        // Help is modal: any key dismisses it, including one that would
+        // otherwise be bound. Nothing is acted on, so `?` then `x` cannot
+        // delete anything.
+        if self.show_help {
+            self.show_help = false;
+            self.pending.clear();
+            return;
+        }
+
+        let mode = self.mode();
+        self.pending.push(pressed);
+        let section = self.section;
+        let resolution = self
+            .keymaps
+            .get(mode)
+            // In a prompt every action applies; in the main view only the
+            // current section's do.
+            .resolve_where(&self.pending, |action| {
+                mode == Mode::Prompt || action.applies_to(section)
+            });
+        match resolution {
+            // A longer chord starts here; wait for the rest.
+            Resolution::Pending => {}
+            Resolution::None => self.pending.clear(),
+            Resolution::Exact(action) => {
+                self.pending.clear();
+                self.dispatch(mode, action);
+            }
+        }
+    }
+
+    fn dispatch(&mut self, mode: Mode, action: Action) {
+        if mode == Mode::Prompt {
+            self.dispatch_prompt(action);
+            return;
+        }
+
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::Help => self.show_help = true,
+            Action::Refresh => self.refresh(),
+
+            Action::NextSection => self.set_section(self.section.next()),
+            Action::PrevSection => self.set_section(self.section.prev()),
+            Action::SectionPasswords => self.set_section(Section::Keyrings),
+            Action::SectionGpgKeys => self.set_section(Section::GpgKeys),
+            Action::SectionSshKeys => self.set_section(Section::SshKeys),
+
+            Action::MoveDown => self.move_selection(1),
+            Action::MoveUp => self.move_selection(-1),
+            Action::First => self.jump_selection(true),
+            Action::Last => self.jump_selection(false),
+            Action::FocusLeft => self.shift_focus(-1),
+            Action::FocusRight => self.shift_focus(1),
+
+            Action::Unlock => self.lock_selected(false),
+            Action::Lock => self.lock_selected(true),
+            Action::ToggleSecret => self.toggle_secret(),
+
+            Action::AgentAdd => self.add_to_agent(),
+            Action::AgentRemove => self.remove_from_agent(),
+            Action::NewSshKey => {
+                if self.section == Section::SshKeys {
+                    self.prompt = Some(Prompt::NewSshKey);
+                }
+            }
+
+            Action::GpgEdit => self.edit_gpg_key(),
+            Action::GpgExport => self.export_gpg_key(),
+            Action::GpgPublish => self.confirm(Prompt::ConfirmGpgPublish),
+            Action::GpgDelete => self.confirm(Prompt::ConfirmGpgDelete),
+            // gpg --full-generate-key asks everything itself, so there is
+            // nothing for us to ask first.
+            Action::NewGpgKey => self.run_gpg(GpgAction::Generate, None),
+            Action::ToggleGpgFilter => self.toggle_gpg_filter(),
+
+            // Prompt-only; harmless if someone binds them in the main map.
+            Action::Confirm
+            | Action::Cancel
+            | Action::Choose1
+            | Action::Choose2
+            | Action::Choose3 => {}
+        }
+    }
+
+    fn dispatch_prompt(&mut self, action: Action) {
+        let Some(prompt) = self.prompt else {
+            return;
+        };
+
         match prompt {
-            Prompt::NewSshKey => match code {
-                KeyCode::Char('1') => self.generate_ssh_key("ed25519", None),
-                KeyCode::Char('2') => self.generate_ssh_key("ecdsa", Some(521)),
-                KeyCode::Char('3') => self.generate_ssh_key("rsa", Some(4096)),
-                KeyCode::Esc | KeyCode::Char('q') => self.cancel_prompt(),
+            Prompt::NewSshKey => match action {
+                // Enter picks the recommended algorithm, like a default
+                // button; the numbers pick explicitly.
+                Action::Choose1 | Action::Confirm => self.generate_ssh_key("ed25519", None),
+                Action::Choose2 => self.generate_ssh_key("ecdsa", Some(521)),
+                Action::Choose3 => self.generate_ssh_key("rsa", Some(4096)),
+                Action::Cancel => self.cancel_prompt(),
                 _ => {}
             },
-            Prompt::ConfirmGpgDelete => match code {
-                KeyCode::Char('y') | KeyCode::Enter => {
+            Prompt::ConfirmGpgDelete => match action {
+                Action::Confirm => {
                     self.prompt = None;
                     let fingerprint = self.selected_gpg_key().map(|key| key.fingerprint.clone());
                     self.run_gpg(GpgAction::Delete, fingerprint);
                 }
-                _ if cancelled => self.cancel_prompt(),
+                Action::Cancel => self.cancel_prompt(),
                 _ => {}
             },
-            Prompt::ConfirmGpgPublish => match code {
-                KeyCode::Char('y') | KeyCode::Enter => {
+            Prompt::ConfirmGpgPublish => match action {
+                Action::Confirm => {
                     self.prompt = None;
                     let fingerprint = self.selected_gpg_key().map(|key| key.fingerprint.clone());
                     self.run_gpg(GpgAction::Publish, fingerprint);
                 }
-                _ if cancelled => self.cancel_prompt(),
+                Action::Cancel => self.cancel_prompt(),
                 _ => {}
             },
         }
@@ -424,6 +495,9 @@ impl App {
         self.hide_secret();
         self.section = section;
         self.error = None;
+        // Each section has its own set of panes, so focus starts at its left.
+        self.pane = panes_for(section)[0];
+        self.detail_scroll = 0;
 
         match section {
             Section::Keyrings => self.status = "keyrings".into(),
@@ -448,48 +522,88 @@ impl App {
         }
     }
 
-    fn focus(&mut self, pane: Pane) {
-        if self.section != Section::Keyrings || self.pane == pane {
+    /// Move focus one pane left or right, stopping at the ends.
+    ///
+    /// Which panes exist depends on the section — see [`panes_for`] — so the
+    /// same `h`/`l` walks a three-pane Passwords view and a two-pane key view.
+    fn shift_focus(&mut self, delta: isize) {
+        let panes = panes_for(self.section);
+        let current = panes
+            .iter()
+            .position(|pane| *pane == self.pane)
+            .unwrap_or(0);
+        let next = (current as isize + delta).clamp(0, panes.len() as isize - 1) as usize;
+        if next == current {
             return;
         }
+
         self.hide_secret();
-        self.pane = pane;
-        if pane == Pane::Items && self.item_state.selected().is_none() && !self.items.is_empty() {
+        self.pane = panes[next];
+        self.detail_scroll = 0;
+
+        // Entering a list that has never had a cursor should put one on the
+        // first row rather than looking empty.
+        if self.pane == Pane::List
+            && self.section == Section::Keyrings
+            && self.item_state.selected().is_none()
+            && !self.items.is_empty()
+        {
             self.item_state.select(Some(0));
         }
     }
 
     fn move_selection(&mut self, delta: isize) {
+        // A focused detail pane scrolls instead of moving a cursor, which is
+        // the only way to reach the bottom of a long GPG key.
+        if self.pane == Pane::Details {
+            self.scroll_details(delta);
+            return;
+        }
+
         self.hide_secret();
-        match self.section {
-            Section::Keyrings => match self.pane {
-                Pane::Keyrings => {
-                    if step(&mut self.keyring_state, self.keyrings.len(), delta) {
-                        self.load_selected_items();
-                    }
+        self.detail_scroll = 0;
+        match (self.section, self.pane) {
+            (Section::Keyrings, Pane::Keyrings) => {
+                if step(&mut self.keyring_state, self.keyrings.len(), delta) {
+                    self.load_selected_items();
                 }
-                Pane::Items => {
-                    step(&mut self.item_state, self.items.len(), delta);
-                }
-            },
-            Section::SshKeys => {
+            }
+            (Section::Keyrings, _) => {
+                step(&mut self.item_state, self.items.len(), delta);
+            }
+            (Section::SshKeys, _) => {
                 step(&mut self.ssh_state, self.ssh_keys.len(), delta);
             }
-            Section::GpgKeys => {
+            (Section::GpgKeys, _) => {
                 step(&mut self.gpg_state, self.gpg_keys.len(), delta);
             }
         }
     }
 
+    /// Scroll the detail pane, clamped to what it actually drew.
+    fn scroll_details(&mut self, delta: isize) {
+        let overflow = self.detail_lines.saturating_sub(self.detail_height);
+        let next = (i32::from(self.detail_scroll) + delta as i32).clamp(0, i32::from(overflow));
+        self.detail_scroll = next as u16;
+    }
+
     fn jump_selection(&mut self, first: bool) {
+        if self.pane == Pane::Details {
+            self.detail_scroll = if first {
+                0
+            } else {
+                self.detail_lines.saturating_sub(self.detail_height)
+            };
+            return;
+        }
+
         self.hide_secret();
-        let (state, len) = match self.section {
-            Section::Keyrings => match self.pane {
-                Pane::Keyrings => (&mut self.keyring_state, self.keyrings.len()),
-                Pane::Items => (&mut self.item_state, self.items.len()),
-            },
-            Section::SshKeys => (&mut self.ssh_state, self.ssh_keys.len()),
-            Section::GpgKeys => (&mut self.gpg_state, self.gpg_keys.len()),
+        self.detail_scroll = 0;
+        let (state, len) = match (self.section, self.pane) {
+            (Section::Keyrings, Pane::Keyrings) => (&mut self.keyring_state, self.keyrings.len()),
+            (Section::Keyrings, _) => (&mut self.item_state, self.items.len()),
+            (Section::SshKeys, _) => (&mut self.ssh_state, self.ssh_keys.len()),
+            (Section::GpgKeys, _) => (&mut self.gpg_state, self.gpg_keys.len()),
         };
         if len == 0 {
             return;
@@ -826,6 +940,7 @@ fn step(state: &mut ListState, len: usize, delta: isize) -> bool {
 mod tests {
     use std::collections::BTreeMap;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use tokio::sync::mpsc::{self, UnboundedReceiver};
 
     use super::*;
@@ -843,7 +958,7 @@ mod tests {
             let (ssh_tx, ssh) = mpsc::unbounded_channel();
             let (gpg_tx, gpg) = mpsc::unbounded_channel();
             Self {
-                app: App::new(secrets_tx, ssh_tx, gpg_tx),
+                app: App::new(secrets_tx, ssh_tx, gpg_tx, Keymaps::default()),
                 secrets,
                 ssh,
                 gpg,
@@ -1651,6 +1766,204 @@ mod tests {
         let mut harness = Harness::gpg_loaded();
         harness.press(KeyCode::Char('x'));
         assert_eq!(harness.app.prompt, Some(Prompt::ConfirmGpgDelete));
+    }
+
+    // --- Navigation and keybindings --------------------------------------
+
+    #[test]
+    fn hl_walks_the_three_passwords_panes() {
+        let mut harness = Harness::loaded();
+        assert_eq!(harness.app.pane, Pane::Keyrings);
+
+        harness.press(KeyCode::Char('l'));
+        assert_eq!(harness.app.pane, Pane::List);
+        harness.press(KeyCode::Char('l'));
+        assert_eq!(harness.app.pane, Pane::Details);
+        harness.press(KeyCode::Char('l'));
+        assert_eq!(harness.app.pane, Pane::Details, "stops at the right edge");
+
+        harness.press(KeyCode::Char('h'));
+        assert_eq!(harness.app.pane, Pane::List);
+        harness.press(KeyCode::Char('h'));
+        assert_eq!(harness.app.pane, Pane::Keyrings);
+        harness.press(KeyCode::Char('h'));
+        assert_eq!(harness.app.pane, Pane::Keyrings, "stops at the left edge");
+    }
+
+    #[test]
+    fn hl_walks_two_panes_in_the_key_sections() {
+        for section in [KeyCode::Char('2'), KeyCode::Char('3')] {
+            let mut harness = Harness::loaded();
+            harness.press(section);
+            assert_eq!(
+                harness.app.pane,
+                Pane::List,
+                "a key section starts on its list, not a sidebar"
+            );
+
+            harness.press(KeyCode::Char('l'));
+            assert_eq!(harness.app.pane, Pane::Details);
+            harness.press(KeyCode::Char('h'));
+            assert_eq!(harness.app.pane, Pane::List);
+            harness.press(KeyCode::Char('h'));
+            assert_eq!(harness.app.pane, Pane::List, "no third pane to the left");
+        }
+    }
+
+    #[test]
+    fn arrows_do_the_same_as_hjkl() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Right);
+        assert_eq!(harness.app.pane, Pane::List);
+        harness.press(KeyCode::Down);
+        assert_eq!(harness.app.item_state.selected(), Some(1));
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.item_state.selected(), Some(0));
+        harness.press(KeyCode::Left);
+        assert_eq!(harness.app.pane, Pane::Keyrings);
+    }
+
+    #[test]
+    fn a_focused_detail_pane_scrolls_instead_of_moving_the_cursor() {
+        let mut harness = Harness::ssh_loaded();
+        harness.app.detail_lines = 40;
+        harness.app.detail_height = 10;
+
+        harness.press(KeyCode::Char('l')); // focus details
+        assert_eq!(harness.app.pane, Pane::Details);
+
+        harness.press(KeyCode::Char('j'));
+        assert_eq!(harness.app.detail_scroll, 1);
+        assert_eq!(
+            harness.app.ssh_state.selected(),
+            Some(0),
+            "the list cursor must not move while the details have focus"
+        );
+
+        harness.press(KeyCode::Char('k'));
+        assert_eq!(harness.app.detail_scroll, 0);
+        harness.press(KeyCode::Char('k'));
+        assert_eq!(harness.app.detail_scroll, 0, "clamped at the top");
+    }
+
+    #[test]
+    fn detail_scrolling_stops_at_the_last_line() {
+        let mut harness = Harness::ssh_loaded();
+        harness.app.detail_lines = 12;
+        harness.app.detail_height = 10;
+        harness.press(KeyCode::Char('l'));
+
+        for _ in 0..10 {
+            harness.press(KeyCode::Char('j'));
+        }
+        assert_eq!(
+            harness.app.detail_scroll, 2,
+            "only the overflow is scrollable"
+        );
+
+        harness.press(KeyCode::Char('G'));
+        assert_eq!(harness.app.detail_scroll, 2);
+        harness.press(KeyCode::Char('g'));
+        assert_eq!(harness.app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn changing_section_resets_focus_and_scroll() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('l'));
+        harness.press(KeyCode::Char('l'));
+        harness.app.detail_scroll = 5;
+
+        harness.press(KeyCode::Char('3'));
+        assert_eq!(harness.app.pane, Pane::List);
+        assert_eq!(harness.app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn a_shared_key_resolves_to_the_section_it_is_in() {
+        // `x` is AgentRemove in SSH and GpgDelete in GPG; `n` is NewSshKey and
+        // NewGpgKey. Both are bound to one key, and the section decides.
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('n'));
+        assert_eq!(harness.app.prompt, Some(Prompt::NewSshKey));
+        harness.press(KeyCode::Esc);
+
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('n'));
+        assert!(harness.app.prompt.is_none(), "gpg asks for itself");
+        assert_eq!(
+            harness.app.take_external().map(|e| e.describe()),
+            Some("gpg --full-generate-key".to_string())
+        );
+    }
+
+    #[test]
+    fn a_custom_keymap_moves_navigation_onto_neio() {
+        use std::collections::BTreeMap;
+
+        use crate::keys::KeymapSection;
+
+        // The layout from the example config: n/e/i/o instead of h/j/k/l.
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            keys: BTreeMap<Mode, KeymapSection>,
+        }
+        let wrapper: Wrapper = toml::from_str(
+            r#"
+            [keys.main]
+            set = [
+                ["MoveDown",   "e"],
+                ["MoveUp",     "i"],
+                ["FocusLeft",  "n"],
+                ["FocusRight", "o"],
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let (secrets_tx, secrets) = mpsc::unbounded_channel();
+        let (ssh_tx, ssh) = mpsc::unbounded_channel();
+        let (gpg_tx, gpg) = mpsc::unbounded_channel();
+        let mut harness = Harness {
+            app: App::new(secrets_tx, ssh_tx, gpg_tx, Keymaps::resolve(&wrapper.keys)),
+            secrets,
+            ssh,
+            gpg,
+        };
+        harness.app.on_reply(Reply::Keyrings(vec![
+            keyring(0, "Login", false),
+            keyring(1, "Session", false),
+        ]));
+        harness.drain();
+
+        harness.press(KeyCode::Char('e'));
+        assert_eq!(
+            harness.app.keyring_state.selected(),
+            Some(1),
+            "e moves down"
+        );
+        harness.press(KeyCode::Char('i'));
+        assert_eq!(harness.app.keyring_state.selected(), Some(0), "i moves up");
+        harness.press(KeyCode::Char('o'));
+        assert_eq!(harness.app.pane, Pane::List, "o focuses right");
+        harness.press(KeyCode::Char('n'));
+        assert_eq!(harness.app.pane, Pane::Keyrings, "n focuses left");
+
+        // The keys those actions used to own are retired, and the ones they
+        // took are no longer doing their old jobs.
+        harness.press(KeyCode::Char('j'));
+        assert_eq!(
+            harness.app.keyring_state.selected(),
+            Some(0),
+            "j is retired"
+        );
+        harness.press(KeyCode::Char('3'));
+        harness.drain();
+        harness.press(KeyCode::Char('n'));
+        assert!(
+            harness.app.prompt.is_none(),
+            "n is navigation now, not new-key"
+        );
     }
 
     // --- Shared chrome ---------------------------------------------------

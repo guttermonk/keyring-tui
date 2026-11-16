@@ -28,12 +28,16 @@ nix build          # or: cargo build --release
 
 ## Keys
 
+Every key is rebindable — see [Configuration](#configuration) — and `?` shows
+the keymap actually in force rather than this table.
+
 | Key | Action |
 | --- | --- |
 | `q`, `Esc` | quit |
 | `?` | help |
 | `Tab`, `1`/`2`/`3` | switch section |
-| `j`/`k`, `↓`/`↑` | move selection |
+| `j`/`k`, `↓`/`↑` | move selection, or scroll a focused detail pane |
+| `h`/`l`, `←`/`→` | focus the pane left / right |
 | `g`/`G` | first / last |
 | `r` | refresh the current section |
 
@@ -64,6 +68,59 @@ In **GPG Keys**:
 | `x` | delete the key — asks first |
 | `f` | show all keys / only keys with a private half |
 
+## Configuration
+
+`$XDG_CONFIG_HOME/keyring-tui/config.toml`, or `--config <path>`. Every value
+in [`config.example.toml`](config.example.toml) is the default, so an empty
+file behaves identically and a missing file is not an error. A malformed one
+*is*, reported before the terminal is taken over — and unknown keys are
+rejected rather than ignored, so a typo tells you.
+
+**Themes.** A preset plus per-slot overrides, in hex or by ANSI name:
+
+```toml
+[theme]
+preset = "gruvbox-dark"   # or terminal (default), catppuccin-mocha, nord
+
+[theme.colors]
+border_focused = "#fabd2f"
+secret = "bright-red"
+```
+
+`terminal` uses the terminal's own palette, so a transparent or themed
+terminal shows through. The slots are `fg`, `bg`, `dim`, `border`,
+`border_focused`, `cursor_fg`/`bg`, `status_fg`/`bg`, `accent`, `ok`, `warn`,
+`danger` and `secret`.
+
+**Keybindings.** Two modes (`main`, `prompt`), four tables each, applied in
+order: `base` replaces the defaults, `set` gives actions exactly these keys,
+`extra` layers keys on top, `unbind` vetoes. So to navigate with `n`/`e`/`i`/`o`
+instead of `h`/`j`/`k`/`l`:
+
+```toml
+[keys.main]
+set = [
+    ["MoveDown",   "e"],
+    ["MoveUp",     "i"],
+    ["FocusLeft",  "n"],
+    ["FocusRight", "o"],
+]
+# `set` also takes each key from whatever held it, so give the old jobs a home:
+extra = [["NewSshKey", "N"], ["NewGpgKey", "N"], ["GpgEdit", "E"]]
+```
+
+`set` retires an action's other keys but never the arrows, `Esc`, `Enter` or
+`ctrl+c`, so a remapped keymap always leaves a way out. A combo is a key
+(`"s"`, `"ctrl+c"`, `{ key = "d", mod = ["Ctrl"] }`) or an array for a chord
+(`["z", "z"]`); there is no chord timeout, so `d` and `dd` cannot coexist.
+
+```console
+keyring-tui keys          # what a config resolves to, and any action left unbound
+```
+
+The format deliberately matches [lazysync](https://github.com/guttermonk/lazysync)'s,
+so a keymap written for one reads the same in the other.
+
 ## Architecture
 
 ```
@@ -71,11 +128,17 @@ main.rs      terminal lifecycle + the select! event loop
 app.rs       all state; synchronous, I/O-free, unit-tested
 ui.rs        rendering — a pure function of &App
 model.rs     domain types the UI speaks (KeyringInfo, ItemInfo, Section)
+config/      config.toml: the theme and the keymap tables
+keys/        actions, key spellings, and how a config merges over the defaults
 backend/     one actor per section, each owning its own I/O
   secrets.rs Secret Service over D-Bus, via oo7
   ssh.rs     ~/.ssh via ssh-key, plus an ssh-agent protocol client
   gpg.rs     the GnuPG keyring via gpgme
 ```
+
+Nothing in the UI hardcodes a key: the footer hints, the help overlay, the
+modal choices and even the "press s to reveal" hint are generated from the
+keymap in force, so a rebound key can't leave the screen lying.
 
 Backends are actors: the UI posts a request and never awaits a reply, so a
 locked keyring waiting on a pinentry can't block the redraw loop. Replies are

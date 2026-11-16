@@ -1,17 +1,29 @@
-//! Rendering. Pure function of `&App` — no state of its own.
+//! Rendering.
+//!
+//! A function of the app state and the resolved [`Palette`], with one
+//! exception: the detail panes report how many lines they drew back into
+//! `App`, because scrolling has to know where the content ends and only the
+//! renderer knows.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 
 use crate::app::{App, Pane, Prompt};
+use crate::config::theme::Palette;
+use crate::keys::{Action, Mode};
 use crate::model::{AgentStatus, Section, format_timestamp};
 
-const ACCENT: Color = Color::Cyan;
+pub fn draw(frame: &mut Frame, app: &mut App, p: &Palette) {
+    // The base layer, so a preset's background covers the whole screen and
+    // the `terminal` preset's `Reset` lets the real terminal show through.
+    frame.render_widget(
+        Block::default().style(Style::default().fg(p.fg).bg(p.bg)),
+        frame.area(),
+    );
 
-pub fn draw(frame: &mut Frame, app: &mut App) {
     let [tabs_area, body_area, status_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
@@ -19,25 +31,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    draw_tabs(frame, tabs_area, app);
+    draw_tabs(frame, tabs_area, app, p);
 
     match app.section {
-        Section::Keyrings => draw_keyrings(frame, body_area, app),
-        Section::GpgKeys => draw_gpg_keys(frame, body_area, app),
-        Section::SshKeys => draw_ssh_keys(frame, body_area, app),
+        Section::Keyrings => draw_keyrings(frame, body_area, app, p),
+        Section::GpgKeys => draw_gpg_keys(frame, body_area, app, p),
+        Section::SshKeys => draw_ssh_keys(frame, body_area, app, p),
     }
 
-    draw_status(frame, status_area, app);
+    draw_status(frame, status_area, app, p);
 
     if let Some(prompt) = app.prompt {
-        draw_prompt(frame, frame.area(), app, prompt);
+        draw_prompt(frame, frame.area(), app, prompt, p);
     }
     if app.show_help {
-        draw_help(frame, frame.area());
+        draw_help(frame, frame.area(), app, p);
     }
 }
 
-fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_tabs(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let titles = Section::ALL.map(|section| {
         let index = section.index() + 1;
         Line::from(format!(" {index} {} ", section.title()))
@@ -47,14 +59,14 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .divider("")
         .highlight_style(
             Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
+                .fg(p.cursor_fg)
+                .bg(p.accent)
                 .add_modifier(Modifier::BOLD),
         );
     frame.render_widget(tabs, area);
 }
 
-fn draw_keyrings(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_keyrings(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     let [left, right] =
         Layout::horizontal([Constraint::Length(30), Constraint::Min(30)]).areas(area);
     let [items_area, detail_area] =
@@ -67,25 +79,23 @@ fn draw_keyrings(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|keyring| {
             let mut spans = vec![Span::raw(keyring.label.clone())];
             if keyring.is_default {
-                spans.push(Span::styled(" (default)", Style::default().dim()));
+                spans.push(Span::styled(" (default)", Style::default().fg(p.dim)));
             }
             if keyring.locked {
-                spans.push(Span::styled(
-                    " [locked]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled(" [locked]", Style::default().fg(p.warn)));
             }
             ListItem::new(Line::from(spans))
         })
         .collect();
 
     let keyrings = List::new(rows)
-        .block(pane_block("Keyrings", app.pane == Pane::Keyrings))
+        .block(pane_block("Keyrings", app.pane == Pane::Keyrings, p))
         .highlight_symbol("▌")
         .highlight_style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
-                .bg(Color::DarkGray),
+                .bg(p.cursor_bg)
+                .fg(p.cursor_fg),
         );
     frame.render_stateful_widget(keyrings, left, &mut app.keyring_state);
 
@@ -96,14 +106,11 @@ fn draw_keyrings(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|item| {
             let mut spans = vec![Span::raw(item.label.clone())];
             if item.locked {
-                spans.push(Span::styled(
-                    " [locked]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled(" [locked]", Style::default().fg(p.warn)));
             }
             spans.push(Span::styled(
                 format!("  {}", item.kind()),
-                Style::default().dim(),
+                Style::default().fg(p.dim),
             ));
             ListItem::new(Line::from(spans))
         })
@@ -114,42 +121,50 @@ fn draw_keyrings(frame: &mut Frame, area: Rect, app: &mut App) {
         None => "Items".to_string(),
     };
     let items = List::new(rows)
-        .block(pane_block(&title, app.pane == Pane::Items))
+        .block(pane_block(&title, app.pane == Pane::List, p))
         .highlight_symbol("▌")
         .highlight_style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
-                .bg(Color::DarkGray),
+                .bg(p.cursor_bg)
+                .fg(p.cursor_fg),
         );
     frame.render_stateful_widget(items, items_area, &mut app.item_state);
 
-    draw_detail(frame, detail_area, app);
+    draw_detail(frame, detail_area, app, p);
 }
 
-fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     let Some(item) = app.selected_item() else {
         let hint = Paragraph::new("No item selected.")
-            .style(Style::default().dim())
-            .block(pane_block("Details", false));
+            .style(Style::default().fg(p.dim))
+            .block(pane_block("Details", app.pane == Pane::Details, p));
         frame.render_widget(hint, area);
         return;
     };
 
     let mut lines = vec![
-        field("Label", &item.label),
-        field("Schema", item.schema().unwrap_or("—")),
-        field("Created", &format_timestamp(item.created)),
-        field("Modified", &format_timestamp(item.modified)),
+        field("Label", &item.label, p),
+        field("Schema", item.schema().unwrap_or("—"), p),
+        field("Created", &format_timestamp(item.created), p),
+        field("Modified", &format_timestamp(item.modified), p),
     ];
 
+    // The reveal hint names the bound key, which may not be `s`.
+    let reveal_hint = match app
+        .keymaps()
+        .get(Mode::Main)
+        .combos_for(Action::ToggleSecret)
+        .first()
+    {
+        Some(combo) => format!("•••••••••  ({combo} to reveal)"),
+        None => "•••••••••".to_string(),
+    };
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<12}", "Secret"), Style::default().dim()),
+        Span::styled(format!("{:<12}", "Secret"), Style::default().fg(p.dim)),
         match &app.revealed {
-            Some(secret) => Span::styled(
-                secret.to_string(),
-                Style::default().fg(Color::LightRed).bold(),
-            ),
-            None => Span::styled("•••••••••  (s to reveal)", Style::default().dim()),
+            Some(secret) => Span::styled(secret.to_string(), Style::default().fg(p.secret).bold()),
+            None => Span::styled(reveal_hint, Style::default().fg(p.dim)),
         },
     ]));
 
@@ -157,23 +172,32 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "Attributes",
-            Style::default().fg(ACCENT),
+            Style::default().fg(p.accent),
         )));
         for (key, value) in &item.attributes {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key}: "), Style::default().dim()),
+                Span::styled(format!("  {key}: "), Style::default().fg(p.dim)),
                 Span::raw(value.clone()),
             ]));
         }
     }
 
+    // Record what was drawn so a focused detail pane knows where to stop
+    // scrolling; only the renderer knows how many lines there are.
+    app.detail_lines = lines.len() as u16;
+    app.detail_height = area.height.saturating_sub(2);
+    let scroll = app
+        .detail_scroll
+        .min(app.detail_lines.saturating_sub(app.detail_height));
+
     let detail = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
-        .block(pane_block("Details", false));
+        .scroll((scroll, 0))
+        .block(pane_block("Details", app.pane == Pane::Details, p));
     frame.render_widget(detail, area);
 }
 
-fn draw_ssh_keys(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_ssh_keys(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     // Wide enough for a long name plus both markers — `ssh-copy-id`-era names
     // like `id_ed25519_sk_nas_backup [agent] [sk]` are 37 columns. The
     // algorithm and size live in the detail pane rather than being truncated
@@ -187,12 +211,12 @@ fn draw_ssh_keys(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|key| {
             let mut spans = vec![Span::raw(key.name.clone())];
             if key.in_agent {
-                spans.push(Span::styled(" [agent]", Style::default().fg(Color::Green)));
+                spans.push(Span::styled(" [agent]", Style::default().fg(p.ok)));
             }
             if key.hardware_backed {
-                spans.push(Span::styled(" [sk]", Style::default().fg(ACCENT)));
+                spans.push(Span::styled(" [sk]", Style::default().fg(p.accent)));
             } else if key.encrypted {
-                spans.push(Span::styled(" [enc]", Style::default().dim()));
+                spans.push(Span::styled(" [enc]", Style::default().fg(p.dim)));
             }
             ListItem::new(Line::from(spans))
         })
@@ -206,19 +230,20 @@ fn draw_ssh_keys(frame: &mut Frame, area: Rect, app: &mut App) {
         (true, agent) => format!("Keys — {}", agent.describe()),
     };
     let keys = List::new(rows)
-        .block(pane_block(&title, true))
+        .block(pane_block(&title, app.pane == Pane::List, p))
         .highlight_symbol("▌")
         .highlight_style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
-                .bg(Color::DarkGray),
+                .bg(p.cursor_bg)
+                .fg(p.cursor_fg),
         );
     frame.render_stateful_widget(keys, left, &mut app.ssh_state);
 
-    draw_ssh_detail(frame, right, app);
+    draw_ssh_detail(frame, right, app, p);
 }
 
-fn draw_ssh_detail(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_ssh_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     let Some(key) = app.selected_ssh_key() else {
         let message = if app.ssh_ready() {
             "No keys found in ~/.ssh."
@@ -226,17 +251,21 @@ fn draw_ssh_detail(frame: &mut Frame, area: Rect, app: &App) {
             "Scanning ~/.ssh…"
         };
         let hint = Paragraph::new(message)
-            .style(Style::default().dim())
-            .block(pane_block("Details", false));
+            .style(Style::default().fg(p.dim))
+            .block(pane_block("Details", app.pane == Pane::Details, p));
         frame.render_widget(hint, area);
         return;
     };
 
     let mut lines = vec![
-        field("Name", &key.name),
+        field("Name", &key.name, p),
         // The compact form is what the list used to show; the wire name is
         // what `ssh-keygen -l` and `authorized_keys` use.
-        field("Algorithm", &format!("{}  ({})", key.kind(), key.algorithm)),
+        field(
+            "Algorithm",
+            &format!("{}  ({})", key.kind(), key.algorithm),
+            p,
+        ),
         field(
             "Comment",
             if key.comment.is_empty() {
@@ -244,25 +273,26 @@ fn draw_ssh_detail(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 &key.comment
             },
+            p,
         ),
-        field("Fingerprint", &key.fingerprint),
+        field("Fingerprint", &key.fingerprint, p),
     ];
 
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<12}", "In agent"), Style::default().dim()),
+        Span::styled(format!("{:<12}", "In agent"), Style::default().fg(p.dim)),
         match (key.in_agent, key.is_addable()) {
-            (true, _) => Span::styled("yes", Style::default().fg(Color::Green)),
-            (false, true) => Span::styled("no  (a to add)", Style::default().dim()),
+            (true, _) => Span::styled("yes", Style::default().fg(p.ok)),
+            (false, true) => Span::styled("no  (a to add)", Style::default().fg(p.dim)),
             // No private key file, so ssh-add has nothing to work with.
-            (false, false) => Span::styled("no", Style::default().dim()),
+            (false, false) => Span::styled("no", Style::default().fg(p.dim)),
         },
     ]));
 
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<12}", "Private key"), Style::default().dim()),
+        Span::styled(format!("{:<12}", "Private key"), Style::default().fg(p.dim)),
         match key.private_path() {
             Some(path) => Span::raw(path.display().to_string()),
-            None => Span::styled("none on disk", Style::default().dim()),
+            None => Span::styled("none on disk", Style::default().fg(p.dim)),
         },
     ]));
     if key.private_path().is_some() {
@@ -275,28 +305,38 @@ fn draw_ssh_detail(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 "none — the file is unencrypted"
             },
+            p,
         ));
     }
     if let Some(path) = &key.public_path {
-        lines.push(field("Public key", &path.display().to_string()));
+        lines.push(field("Public key", &path.display().to_string(), p));
     }
 
     if !key.public_line.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "authorized_keys line",
-            Style::default().fg(ACCENT),
+            Style::default().fg(p.accent),
         )));
         lines.push(Line::raw(key.public_line.clone()));
     }
 
+    // Record what was drawn so a focused detail pane knows where to stop
+    // scrolling; only the renderer knows how many lines there are.
+    app.detail_lines = lines.len() as u16;
+    app.detail_height = area.height.saturating_sub(2);
+    let scroll = app
+        .detail_scroll
+        .min(app.detail_lines.saturating_sub(app.detail_height));
+
     let detail = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
-        .block(pane_block("Details", false));
+        .scroll((scroll, 0))
+        .block(pane_block("Details", app.pane == Pane::Details, p));
     frame.render_widget(detail, area);
 }
 
-fn draw_gpg_keys(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_gpg_keys(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     let [left, right] =
         Layout::horizontal([Constraint::Length(44), Constraint::Min(30)]).areas(area);
 
@@ -306,15 +346,15 @@ fn draw_gpg_keys(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|key| {
             let mut spans = vec![Span::raw(key.primary_uid.clone())];
             if key.has_secret {
-                spans.push(Span::styled(" [sec]", Style::default().fg(Color::Green)));
+                spans.push(Span::styled(" [sec]", Style::default().fg(p.ok)));
             }
             if key.on_card {
-                spans.push(Span::styled(" [card]", Style::default().fg(ACCENT)));
+                spans.push(Span::styled(" [card]", Style::default().fg(p.accent)));
             }
             if let Some(state) = key.state() {
                 spans.push(Span::styled(
                     format!(" [{state}]"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(p.warn),
                 ));
             }
             ListItem::new(Line::from(spans))
@@ -327,19 +367,20 @@ fn draw_gpg_keys(frame: &mut Frame, area: Rect, app: &mut App) {
         "Keys — reading…".to_string()
     };
     let keys = List::new(rows)
-        .block(pane_block(&title, true))
+        .block(pane_block(&title, app.pane == Pane::List, p))
         .highlight_symbol("▌")
         .highlight_style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
-                .bg(Color::DarkGray),
+                .bg(p.cursor_bg)
+                .fg(p.cursor_fg),
         );
     frame.render_stateful_widget(keys, left, &mut app.gpg_state);
 
-    draw_gpg_detail(frame, right, app);
+    draw_gpg_detail(frame, right, app, p);
 }
 
-fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     let Some(key) = app.selected_gpg_key() else {
         let message = if app.gpg_ready() {
             match app.gpg_filter {
@@ -350,26 +391,27 @@ fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &App) {
             "Reading the GnuPG keyring…"
         };
         let hint = Paragraph::new(message)
-            .style(Style::default().dim())
-            .block(pane_block("Details", false));
+            .style(Style::default().fg(p.dim))
+            .block(pane_block("Details", app.pane == Pane::Details, p));
         frame.render_widget(hint, area);
         return;
     };
 
     let mut lines = vec![
-        field("Key ID", &key.key_id),
-        field("Fingerprint", &group_fingerprint(&key.fingerprint)),
-        field("Algorithm", &key.algorithm),
-        field("Created", &format_timestamp(key.created)),
+        field("Key ID", &key.key_id, p),
+        field("Fingerprint", &group_fingerprint(&key.fingerprint), p),
+        field("Algorithm", &key.algorithm, p),
+        field("Created", &format_timestamp(key.created), p),
         field(
             "Expires",
             &match key.expires {
                 Some(expires) => format_timestamp(Some(expires)),
                 None => "never".into(),
             },
+            p,
         ),
-        field("Owner trust", key.owner_trust),
-        field("Capabilities", &describe_capabilities(&key.capabilities)),
+        field("Owner trust", key.owner_trust, p),
+        field("Capabilities", &describe_capabilities(&key.capabilities), p),
         field(
             "Private key",
             if key.has_secret {
@@ -377,32 +419,30 @@ fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 "not held"
             },
+            p,
         ),
     ];
 
     if let Some(state) = key.state() {
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<12}", "State"), Style::default().dim()),
-            Span::styled(state.to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{:<12}", "State"), Style::default().fg(p.dim)),
+            Span::styled(state.to_string(), Style::default().fg(p.warn)),
         ]));
     }
 
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "User IDs",
-        Style::default().fg(ACCENT),
+        Style::default().fg(p.accent),
     )));
     for uid in &key.uids {
         let mut spans = vec![
             Span::styled("  ", Style::default()),
             Span::raw(uid.uid.clone()),
-            Span::styled(format!("  ({})", uid.validity), Style::default().dim()),
+            Span::styled(format!("  ({})", uid.validity), Style::default().fg(p.dim)),
         ];
         if uid.revoked {
-            spans.push(Span::styled(
-                " [revoked]",
-                Style::default().fg(Color::Yellow),
-            ));
+            spans.push(Span::styled(" [revoked]", Style::default().fg(p.warn)));
         }
         lines.push(Line::from(spans));
     }
@@ -410,7 +450,7 @@ fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "Subkeys",
-        Style::default().fg(ACCENT),
+        Style::default().fg(p.accent),
     )));
     for subkey in &key.subkeys {
         let mut spans = vec![
@@ -423,29 +463,32 @@ fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &App) {
                     subkey.capabilities,
                     format_timestamp(subkey.created)
                 ),
-                Style::default().dim(),
+                Style::default().fg(p.dim),
             ),
         ];
         if subkey.on_card {
-            spans.push(Span::styled(" [card]", Style::default().fg(ACCENT)));
+            spans.push(Span::styled(" [card]", Style::default().fg(p.accent)));
         }
         if subkey.revoked {
-            spans.push(Span::styled(
-                " [revoked]",
-                Style::default().fg(Color::Yellow),
-            ));
+            spans.push(Span::styled(" [revoked]", Style::default().fg(p.warn)));
         } else if subkey.expired {
-            spans.push(Span::styled(
-                " [expired]",
-                Style::default().fg(Color::Yellow),
-            ));
+            spans.push(Span::styled(" [expired]", Style::default().fg(p.warn)));
         }
         lines.push(Line::from(spans));
     }
 
+    // Record what was drawn so a focused detail pane knows where to stop
+    // scrolling; only the renderer knows how many lines there are.
+    app.detail_lines = lines.len() as u16;
+    app.detail_height = area.height.saturating_sub(2);
+    let scroll = app
+        .detail_scroll
+        .min(app.detail_lines.saturating_sub(app.detail_height));
+
     let detail = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
-        .block(pane_block("Details", false));
+        .scroll((scroll, 0))
+        .block(pane_block("Details", app.pane == Pane::Details, p));
     frame.render_widget(detail, area);
 }
 
@@ -481,34 +524,79 @@ fn group_fingerprint(fingerprint: &str) -> String {
         .join(" ")
 }
 
-fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    // The hints are section-specific, so the width follows the longest one.
-    let hints = match app.section {
-        Section::Keyrings => "j/k move  u unlock  s secret  ? help ",
-        Section::SshKeys => "j/k move  a add  x remove  n new  ? help ",
-        Section::GpgKeys => "j/k move  e edit  y export  n new  ? help ",
-    };
+fn draw_status(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
+    let hints = format!("{} ", hint_line(app));
     let [message_area, keys_area] = Layout::horizontal([
         Constraint::Min(10),
-        Constraint::Length(hints.len() as u16 + 1),
+        // Measured in characters, not bytes: a rebound key may be anything.
+        Constraint::Length(hints.chars().count() as u16 + 1),
     ])
     .areas(area);
 
+    let bar = Style::default().fg(p.status_fg).bg(p.status_bg);
     let message = match &app.error {
-        Some(error) => Span::styled(
-            format!(" {error}"),
-            Style::default().fg(Color::White).bg(Color::Red),
-        ),
-        None => Span::styled(format!(" {}", app.status), Style::default().dim()),
+        Some(error) => Span::styled(format!(" {error}"), Style::default().fg(p.fg).bg(p.danger)),
+        None => Span::styled(format!(" {}", app.status), Style::default().fg(p.dim)),
     };
-    frame.render_widget(Paragraph::new(Line::from(message)), message_area);
+    frame.render_widget(Paragraph::new(Line::from(message)).style(bar), message_area);
 
-    let keys = Paragraph::new(Line::from(Span::styled(hints, Style::default().dim())))
+    let keys = Paragraph::new(Line::from(Span::styled(hints, Style::default().fg(p.dim))))
+        .style(bar)
         .alignment(Alignment::Right);
     frame.render_widget(keys, keys_area);
 }
 
-fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt) {
+/// The footer hints, built from the keymap in force rather than hardcoded —
+/// otherwise a rebound key would leave the footer lying.
+fn hint_line(app: &App) -> String {
+    let map = app.keymaps().get(Mode::Main);
+    let key = |action: Action| -> Option<String> {
+        let combos = map.combos_for(action);
+        // Prefer a named key over an arrow. `set` keeps the arrows, and they
+        // keep their original position, so the arrow would otherwise be what
+        // a rebound keymap advertises — less useful than the key the user
+        // actually chose.
+        combos
+            .iter()
+            .find(|combo| !combo.is_bare_arrow())
+            .or_else(|| combos.first())
+            .map(|combo| combo.to_string())
+    };
+
+    // Movement reads as a pair, since the two keys are always learned
+    // together: `j/k move`, or `e/i move` for a rebound keymap.
+    let mut parts = Vec::new();
+    if let (Some(down), Some(up)) = (key(Action::MoveDown), key(Action::MoveUp)) {
+        parts.push(format!("{down}/{up} move"));
+    }
+
+    let section_actions: &[(Action, &str)] = match app.section {
+        Section::Keyrings => &[(Action::Unlock, "unlock"), (Action::ToggleSecret, "secret")],
+        Section::SshKeys => &[
+            (Action::AgentAdd, "add"),
+            (Action::AgentRemove, "remove"),
+            (Action::NewSshKey, "new"),
+        ],
+        Section::GpgKeys => &[
+            (Action::GpgEdit, "edit"),
+            (Action::GpgExport, "export"),
+            (Action::NewGpgKey, "new"),
+        ],
+    };
+    for (action, label) in section_actions {
+        if let Some(combo) = key(*action) {
+            parts.push(format!("{combo} {label}"));
+        }
+    }
+
+    if let Some(combo) = key(Action::Help) {
+        parts.push(format!("{combo} help"));
+    }
+
+    parts.join("  ")
+}
+
+fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt, p: &Palette) {
     // Confirmations name the key they are about, so there is no doubt which
     // one is about to be deleted or published.
     let subject = app
@@ -528,58 +616,133 @@ fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt) {
         ),
     };
 
-    let lines: Vec<Line> = body.lines().map(annotate_key).collect();
+    // The prose is written out; the keys come from the prompt keymap, so a
+    // rebound confirmation does not leave the modal advertising `y`.
+    let choices: &[(Action, &str)] = match prompt {
+        Prompt::NewSshKey => &[
+            (Action::Choose1, "ed25519        (recommended)"),
+            (Action::Choose2, "ecdsa p521"),
+            (Action::Choose3, "rsa 4096"),
+            (Action::Cancel, "cancel"),
+        ],
+        Prompt::ConfirmGpgDelete => &[(Action::Confirm, "delete"), (Action::Cancel, "cancel")],
+        Prompt::ConfirmGpgPublish => &[(Action::Confirm, "publish"), (Action::Cancel, "cancel")],
+    };
+
+    let map = app.keymaps().get(Mode::Prompt);
+    let mut lines: Vec<Line> = body.lines().map(|line| annotate_key(line, p)).collect();
+    lines.push(Line::raw(""));
+    for (action, label) in choices {
+        let combos: Vec<String> = map
+            .combos_for(*action)
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        if combos.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<10}", combos.join(", ")),
+                Style::default().fg(p.accent).bold(),
+            ),
+            Span::raw((*label).to_string()),
+        ]));
+    }
     let popup = centered(area, 62, lines.len() as u16 + 2);
     frame.render_widget(Clear, popup);
 
     let widget = Paragraph::new(Text::from(lines)).block(
         Block::bordered()
             .title(title)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(p.warn)),
     );
     frame.render_widget(widget, popup);
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 58, HELP.lines().count() as u16 + 2);
-    frame.render_widget(Clear, popup);
+/// The help overlay, generated from the keymap in force.
+///
+/// Built rather than written out, so a rebound key shows the user's key and
+/// an unbound action disappears instead of being advertised.
+fn draw_help(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
+    let map = app.keymaps().get(Mode::Main);
 
-    let lines: Vec<Line> = HELP.lines().map(annotate_key).collect();
+    let mut lines: Vec<Line> = Vec::new();
+    let mut current_group = None;
+
+    // Only what works here: the other sections' keys would be noise, and two
+    // sections can share a key with different meanings.
+    for action in map
+        .actions()
+        .into_iter()
+        .filter(|action| action.applies_to(app.section))
+    {
+        let group = action.section();
+        if group != current_group {
+            if let Some(section) = group {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    section.title().to_string(),
+                    Style::default().fg(p.accent).bold(),
+                ));
+            }
+            current_group = group;
+        }
+
+        let combos: Vec<String> = map
+            .combos_for(action)
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<12}", combos.join(", ")),
+                Style::default().fg(p.accent).bold(),
+            ),
+            Span::raw(action.describe().to_string()),
+        ]));
+    }
+
+    // The widest key column decides the width; the longest description is
+    // about 44 columns, and the border adds two.
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = centered(area, 62, height);
+    frame.render_widget(Clear, popup);
 
     let help = Paragraph::new(Text::from(lines)).block(
         Block::bordered()
-            .title(" Keys ")
-            .border_style(Style::default().fg(ACCENT)),
+            .title(format!(" Keys — {} ", app.section.title()))
+            .border_style(Style::default().fg(p.accent)),
     );
     frame.render_widget(help, popup);
 }
 
 /// Style a `keys  description` line, highlighting the key column. Lines
 /// without that shape (blank lines, group headings) are left alone.
-fn annotate_key(line: &str) -> Line<'static> {
+fn annotate_key(line: &str, p: &Palette) -> Line<'static> {
     match line.split_once("  ") {
         Some((keys, description)) if !keys.is_empty() => Line::from(vec![
-            Span::styled(format!(" {keys:<10}"), Style::default().fg(ACCENT).bold()),
+            Span::styled(format!(" {keys:<10}"), Style::default().fg(p.accent).bold()),
             Span::raw(description.trim().to_string()),
         ]),
-        _ => Line::styled(line.to_string(), Style::default().dim()),
+        _ => Line::styled(line.to_string(), Style::default().fg(p.dim)),
     }
 }
 
-fn pane_block(title: &str, focused: bool) -> Block<'static> {
+fn pane_block(title: &str, focused: bool, p: &Palette) -> Block<'static> {
     let border = if focused {
-        Style::default().fg(ACCENT)
+        Style::default().fg(p.border_focused)
     } else {
-        Style::default().dim()
+        Style::default().fg(p.border)
     };
     Block::bordered()
         .title(format!(" {title} "))
         .border_style(border)
 }
 
-fn field(name: &str, value: &str) -> Line<'static> {
+fn field(name: &str, value: &str, p: &Palette) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{name:<12}"), Style::default().dim()),
+        Span::styled(format!("{name:<12}"), Style::default().fg(p.dim)),
         Span::raw(value.to_string()),
     ])
 }
@@ -595,58 +758,22 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-const HELP: &str = "\
-q, Esc  quit
-?  toggle this help
-Tab  next section
-1/2/3  jump to section
-j/k  move selection
-g/G  first / last
-r  refresh the current section
-
-Passwords
-h/l  focus keyrings / items
-u  unlock selected keyring
-L  lock selected keyring
-s  reveal / hide the secret
-
-SSH keys
-a  add to the agent (runs ssh-add)
-x  remove from the agent
-n  new key (runs ssh-keygen)
-
-GPG keys
-e  edit: trust, expiry, UIDs, revoke, certify
-y  print the armoured public key
-n  new key (runs gpg --full-generate-key)
-p  publish to a keyserver
-x  delete the key
-f  show all keys / only secret keys
-";
+// The help overlay is generated from the keymap in force — see `draw_help`.
+// Only prose lives here; every key the UI mentions comes from the keymap, so
+// a rebound key never leaves the screen lying.
 
 const NEW_SSH_KEY_PROMPT: &str = "\
 ssh-keygen will ask for the path and passphrase.
-
-1  ed25519        (recommended)
-2  ecdsa p521
-3  rsa 4096
-Esc  cancel
 ";
 
 const DELETE_GPG_KEY_PROMPT: &str = "\
 Runs gpg --delete-key, which asks again. A key whose private
 half you hold is refused, as gpg wants --delete-secret-keys.
-
-y  delete
-Esc  cancel
 ";
 
 const PUBLISH_GPG_KEY_PROMPT: &str = "\
 Runs gpg --send-keys. Keyservers do not forget: a published
 key, and every user ID on it, stays public.
-
-y  publish
-Esc  cancel
 ";
 
 #[cfg(test)]
@@ -659,6 +786,7 @@ mod tests {
 
     use super::*;
     use crate::backend::Reply;
+    use crate::keys::Keymaps;
     use crate::model::{
         AgentStatus, GpgFilter, GpgKeyInfo, GpgSubkey, GpgUid, ItemInfo, KeyringInfo, SshKeyInfo,
     };
@@ -667,7 +795,8 @@ mod tests {
     /// that a label is present without pinning the exact layout.
     fn render(app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
-        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let palette = Palette::default();
+        terminal.draw(|frame| draw(frame, app, &palette)).unwrap();
 
         let buffer = terminal.backend().buffer().clone();
         let area = buffer.area;
@@ -687,7 +816,7 @@ mod tests {
         let (gpg, _gpg_rx) = mpsc::unbounded_channel();
         // The receivers are dropped, so requests go nowhere: these tests only
         // care about what a given state renders as.
-        App::new(secrets, ssh, gpg)
+        App::new(secrets, ssh, gpg, Keymaps::default())
     }
 
     fn ssh_key(name: &str, in_agent: bool) -> SshKeyInfo {
@@ -902,6 +1031,9 @@ mod tests {
         let screen = render(&mut app);
         assert!(screen.contains("New SSH key"), "{screen}");
         assert!(screen.contains("ed25519"), "{screen}");
-        assert!(screen.contains("Esc"), "{screen}");
+        assert!(
+            screen.contains("esc"),
+            "the cancel key comes from the keymap, lower-cased:\n{screen}"
+        );
     }
 }

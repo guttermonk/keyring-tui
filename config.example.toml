@@ -1,0 +1,129 @@
+# keyring-tui configuration
+#
+# Copy to $XDG_CONFIG_HOME/keyring-tui/config.toml. Every value below is the
+# default, so an empty file behaves identically to this one, and a missing
+# file is not an error.
+#
+# A malformed file *is* an error, reported before the terminal is taken over:
+# a config that silently does nothing is worse than one that refuses to load.
+# Unknown keys are rejected rather than ignored, so a typo tells you instead
+# of quietly doing nothing.
+#
+# Run `keyring-tui keys` to see what a config resolves to.
+
+# ─── Theme ───────────────────────────────────────────────────────────────────
+
+[theme]
+# "terminal" follows your terminal's own palette, so a transparent or themed
+# terminal shows through. Also: "catppuccin-mocha", "gruvbox-dark", "nord".
+preset = "terminal"
+
+# Individual colours can be overridden on top of the preset. Values are either
+# hex ("#89b4fa" or "0x89b4fa") or an ANSI name: reset, black, red, green,
+# yellow, blue, magenta, cyan, gray, dark-gray, and bright-red through
+# bright-white.
+#
+# Slots:
+#
+#   fg, bg              text and background; "reset" keeps the terminal's own
+#   dim                 field labels, schemas, timestamps, hints
+#   border              an unfocused pane's border
+#   border_focused      the focused pane's border
+#   cursor_fg/bg        the selected row, and the selected tab
+#   status_fg/bg        the status bar
+#   accent              headings, [sk] and [card] markers
+#   ok                  [agent], "in agent: yes"
+#   warn                [locked], [expired], [revoked], a modal's border
+#   danger              errors
+#   secret              a revealed password — deliberately loud
+#
+# [theme.colors]
+# border_focused = "#fabd2f"
+# secret = "bright-red"     # it is on screen; it should look like it
+# warn = "yellow"           # locked keyrings, expired keys
+
+# ─── Keybindings ─────────────────────────────────────────────────────────────
+#
+# Two modes, because `y` confirms a prompt and exports a key in the main view:
+#
+#     main      the lists — navigation, sections, per-section operations
+#     prompt    a modal question: a confirmation, or the new-key chooser
+#
+# Four tables per mode, applied in this order:
+#
+#     base      start from nothing but this — replaces the defaults entirely
+#     set       these ACTIONS get exactly these keys, losing the ones they had
+#     extra     these KEYS get these actions, on top of whatever is there
+#     unbind    these keys do nothing; applied last, so nothing reinstates them
+#
+# `set` vs `extra` is the distinction that matters:
+#
+#     set   = [["MoveDown", "e"]]   -- "move down is on e now"; j stops working
+#     extra = [["MoveDown", "e"]]   -- "e also moves down";     j still works
+#
+# `set` replaces an action's other keys, so list every one you want to keep --
+# except the arrows, Esc, Enter and ctrl+c, which it never retires, so a
+# remapped keymap always leaves a way out. Use `unbind = ["down"]` if you
+# really want an arrow gone. `unbind` is prefix-based: unbinding "g" also
+# removes any "g…" chord, or "g" would still be swallowed while keyring-tui
+# waited for the rest.
+#
+# A key combo is a single key, a key with modifiers, or an array for a chord:
+#
+#     "s"                          -- plain key, case-sensitive: G is not g
+#     "ctrl+c"
+#     { key = "d", mod = ["Ctrl"] }
+#     ["z", "z"]                   -- chord: z then z
+#
+# Modifiers: "Alt", "Ctrl", "Shift", "Super".
+# Named keys: enter, space, tab, backtab, backspace, esc, up, down, left,
+# right, home, end, pageup, pagedown, delete, insert, f1-f12.
+#
+# There is no chord timeout: a key that completes a binding fires at once, so
+# `d` and `dd` cannot coexist. Bind the longer one only.
+#
+# Actions in the `main` mode. A section-specific action does nothing in the
+# other sections, which is why one key can mean "remove from the agent" in
+# SSH Keys and "delete this key" in GPG Keys:
+#
+#   anywhere    Quit Help Refresh NextSection PrevSection
+#               SectionPasswords SectionGpgKeys SectionSshKeys
+#               MoveDown MoveUp First Last FocusLeft FocusRight
+#   Passwords   Unlock Lock ToggleSecret
+#   SSH Keys    AgentAdd AgentRemove NewSshKey
+#   GPG Keys    GpgEdit GpgExport GpgPublish GpgDelete NewGpgKey
+#               ToggleGpgFilter
+#
+# Actions in the `prompt` mode: Confirm Cancel Choose1 Choose2 Choose3.
+
+[keys.main]
+# Move navigation onto your own keys, retiring h/j/k/l for it and leaving
+# every other binding untouched. `set` also takes each key away from whatever
+# else held it, so `n` stops being new-key and `e` stops being edit:
+# set = [
+#     ["MoveDown",   "e"],
+#     ["MoveUp",     "i"],
+#     ["FocusLeft",  "n"],
+#     ["FocusRight", "o"],
+#     ["FocusRight", "enter"],   # a SECOND entry, not ["o","enter"] --
+#                                # an array means a CHORD: o then Enter
+# ]
+#
+# Having moved `n` and `e`, give their old jobs somewhere to live:
+# extra = [
+#     ["NewSshKey", "N"],
+#     ["NewGpgKey", "N"],
+#     ["GpgEdit",   "E"],
+# ]
+#
+# Free a key for a terminal multiplexer -- zellij or tmux closing a popup on
+# Esc only gets Esc if keyring-tui is not sitting on it:
+# unbind = ["esc"]
+
+[keys.prompt]
+# The confirmation and chooser modals. Printable keys are safe to bind here:
+# there are no text fields anywhere in keyring-tui.
+# extra = [
+#     ["Confirm", "enter"],
+#     ["Cancel",  "backspace"],
+# ]
