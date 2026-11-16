@@ -1,0 +1,49 @@
+[package]
+name = "keyring-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Terminal UI for GPG keys, SSH keys and the GNOME keyring"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/guttermonk/keyring-tui"
+
+[dependencies]
+# TUI
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+
+# Async runtime + D-Bus (oo7 pulls zbus in on the tokio reactor).
+# `net` + `io-util` are for the ssh-agent socket.
+tokio = { version = "1.54", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+] }
+futures-util = "0.3"
+
+# Secret Service / GNOME keyring
+oo7 = { version = "0.7", default-features = false, features = ["tokio", "native_crypto"] }
+
+# Secret material: wiped on drop, never printed by Debug
+zeroize = { version = "1.9", features = ["derive"] }
+secrecy = "0.10"
+
+# Errors
+color-eyre = "0.6"
+
+# Timestamps (Secret Service reports created/modified as seconds since epoch)
+jiff = "1.0"
+
+# OpenSSH key parsing. Deliberately no algorithm crypto features: we only read
+# metadata and fingerprints, and never sign, verify or decrypt a private key.
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ecdsa"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[profile.release]
+lto = "thin"
+strip = true
