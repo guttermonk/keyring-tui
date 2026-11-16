@@ -20,6 +20,18 @@
           nativeBuildInputs = with pkgs; [ pkg-config ];
           buildInputs = with pkgs; [ gpgme libgpg-error libassuan ];
 
+          postInstall = ''
+            # The launcher entry. No icon is installed with it: Icon= names a
+            # themed icon so it follows the user's icon theme rather than
+            # shipping a look of our own.
+            install -Dm644 keyring-tui.desktop \
+              $out/share/applications/keyring-tui.desktop
+
+            # The commented default config, for `man`-less discovery.
+            install -Dm644 config.example.toml \
+              $out/share/doc/keyring-tui/config.example.toml
+          '';
+
           meta = with pkgs.lib; {
             description = "Terminal UI for GPG keys, SSH keys and the GNOME keyring";
             license = licenses.gpl3Plus;

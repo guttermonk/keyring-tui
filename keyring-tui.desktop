@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=keyring-tui
+GenericName=Key and Password Manager
+Comment=Manage GPG keys, SSH keys and the GNOME keyring from a terminal
+TryExec=keyring-tui
+Exec=keyring-tui
+# A themed name rather than a bundled image, so the icon follows whatever
+# theme is in use. `dialog-password` is the freedesktop name for exactly this
+# idea and is a padlock in every theme that ships it. It is not in modern
+# Adwaita, which keeps only `dialog-password-symbolic`; swap in
+# `application-certificate` if you want a name every theme still carries.
+Icon=dialog-password
+# A TUI: the launcher has to hand it a terminal, and there is no window to
+# wait for, so no startup notification either.
+Terminal=true
+StartupNotify=false
+# One main category (System) plus the Security sub-category: listing two main
+# categories makes the app show up twice in some menus.
+Categories=System;Security;
+Keywords=gpg;gnupg;pgp;ssh;key;keyring;password;passphrase;secret;encryption;seahorse;

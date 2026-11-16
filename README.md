@@ -68,6 +68,22 @@ In **GPG Keys**:
 | `x` | delete the key — asks first |
 | `f` | show all keys / only keys with a private half |
 
+## Desktop entry
+
+`keyring-tui.desktop` is installed by the flake into
+`$out/share/applications`. It sets `Terminal=true`, so a launcher hands it a
+terminal; `Icon=dialog-password` names a *themed* icon — a padlock — so it
+follows your icon theme instead of shipping a look of its own.
+
+`dialog-password` is in Papirus, Breeze and the gnome theme, but modern
+Adwaita keeps only `dialog-password-symbolic`. If your desktop falls back to
+Adwaita and you get a generic icon, `application-certificate` is the name
+every theme still carries. Installing by hand:
+
+```console
+install -Dm644 keyring-tui.desktop ~/.local/share/applications/keyring-tui.desktop
+```
+
 ## Configuration
 
 `$XDG_CONFIG_HOME/keyring-tui/config.toml`, or `--config <path>`. Every value
