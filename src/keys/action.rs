@@ -18,15 +18,19 @@ pub enum Mode {
     Main,
     /// A modal question — a confirmation, or the new-key chooser.
     Prompt,
+    /// A text field. Printable keys are literal text here, so only keys
+    /// that cannot be typed are bound.
+    Input,
 }
 
 impl Mode {
-    pub const ALL: [Self; 2] = [Self::Main, Self::Prompt];
+    pub const ALL: [Self; 3] = [Self::Main, Self::Prompt, Self::Input];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Main => "main",
             Self::Prompt => "prompt",
+            Self::Input => "input",
         }
     }
 }
@@ -73,6 +77,7 @@ pub enum Action {
     AgentAdd,
     AgentRemove,
     NewSshKey,
+    SshCopyId,
 
     // GPG keys.
     GpgEdit,
@@ -81,6 +86,8 @@ pub enum Action {
     GpgDelete,
     NewGpgKey,
     ToggleGpgFilter,
+    GpgImport,
+    GpgSearch,
 
     // Prompts.
     Confirm,
@@ -88,6 +95,17 @@ pub enum Action {
     Choose1,
     Choose2,
     Choose3,
+
+    // Text fields. Only keys that cannot be typed are bound here; anything
+    // printable is literal text, so there is no `InsertChar` action.
+    Backspace,
+    DeleteChar,
+    CursorLeft,
+    CursorRight,
+    CursorHome,
+    CursorEnd,
+    DeleteWord,
+    ClearBefore,
 }
 
 impl Action {
@@ -114,17 +132,28 @@ impl Action {
             Self::AgentAdd => "add to the ssh-agent (runs ssh-add)",
             Self::AgentRemove => "remove from the ssh-agent",
             Self::NewSshKey => "new SSH key (runs ssh-keygen)",
+            Self::SshCopyId => "copy this key to a host (runs ssh-copy-id)",
             Self::GpgEdit => "edit: trust, expiry, UIDs, revoke, certify",
             Self::GpgExport => "print the armoured public key",
             Self::GpgPublish => "publish to a keyserver",
             Self::GpgDelete => "delete the key",
             Self::NewGpgKey => "new GPG key (runs gpg --full-generate-key)",
             Self::ToggleGpgFilter => "show all keys / only secret keys",
+            Self::GpgImport => "import keys from a file",
+            Self::GpgSearch => "search a keyserver",
             Self::Confirm => "confirm",
             Self::Cancel => "cancel",
             Self::Choose1 => "first choice",
             Self::Choose2 => "second choice",
             Self::Choose3 => "third choice",
+            Self::Backspace => "delete the character before the cursor",
+            Self::DeleteChar => "delete the character under the cursor",
+            Self::CursorLeft => "move the cursor left",
+            Self::CursorRight => "move the cursor right",
+            Self::CursorHome => "start of the line",
+            Self::CursorEnd => "end of the line",
+            Self::DeleteWord => "delete the word before the cursor",
+            Self::ClearBefore => "delete to the start of the line",
         }
     }
 
@@ -132,12 +161,16 @@ impl Action {
     pub fn section(self) -> Option<Section> {
         match self {
             Self::Unlock | Self::Lock | Self::ToggleSecret => Some(Section::Keyrings),
-            Self::AgentAdd | Self::AgentRemove | Self::NewSshKey => Some(Section::SshKeys),
+            Self::AgentAdd | Self::AgentRemove | Self::NewSshKey | Self::SshCopyId => {
+                Some(Section::SshKeys)
+            }
             Self::GpgEdit
             | Self::GpgExport
             | Self::GpgPublish
             | Self::GpgDelete
             | Self::NewGpgKey
+            | Self::GpgImport
+            | Self::GpgSearch
             | Self::ToggleGpgFilter => Some(Section::GpgKeys),
             _ => None,
         }

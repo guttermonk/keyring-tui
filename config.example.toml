@@ -112,10 +112,12 @@ preset = "terminal"
 
 # ─── Keybindings ─────────────────────────────────────────────────────────────
 #
-# Two modes, because `y` confirms a prompt and exports a key in the main view:
+# Three modes, because `y` confirms a prompt and exports a key in the main
+# view, and in a text field it is just the letter y:
 #
 #     main      the lists — navigation, sections, per-section operations
 #     prompt    a modal question: a confirmation, or the new-key chooser
+#     input     a text field — a path, a host, a search term
 #
 # Four tables per mode, applied in this order:
 #
@@ -158,11 +160,18 @@ preset = "terminal"
 #               SectionPasswords SectionGpgKeys SectionSshKeys
 #               MoveDown MoveUp First Last FocusLeft FocusRight
 #   Passwords   Unlock Lock ToggleSecret
-#   SSH Keys    AgentAdd AgentRemove NewSshKey
+#   SSH Keys    AgentAdd AgentRemove NewSshKey SshCopyId
 #   GPG Keys    GpgEdit GpgExport GpgPublish GpgDelete NewGpgKey
-#               ToggleGpgFilter
+#               ToggleGpgFilter GpgImport GpgSearch
 #
 # Actions in the `prompt` mode: Confirm Cancel Choose1 Choose2 Choose3.
+#
+# Actions in the `input` mode — a text field, where every printable key is
+# literal text, so only these are bound: Confirm Cancel Backspace DeleteChar
+# CursorLeft CursorRight CursorHome CursorEnd DeleteWord ClearBefore.
+#
+# The field is never a passphrase box. Anything needing a secret hands the
+# terminal to pinentry, ssh-add or gpg, so there is no masked mode here.
 
 [keys.main]
 # Move navigation onto your own keys, retiring h/j/k/l for it and leaving
@@ -187,6 +196,12 @@ preset = "terminal"
 # Free a key for a terminal multiplexer -- zellij or tmux closing a popup on
 # Esc only gets Esc if keyring-tui is not sitting on it:
 # unbind = ["esc"]
+
+[keys.input]
+# Printable keys are text here, so only keys that cannot be typed are bound.
+# extra = [
+#     ["ClearBefore", "ctrl+k"],
+# ]
 
 [keys.prompt]
 # The confirmation and chooser modals. Printable keys are safe to bind here:

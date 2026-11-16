@@ -14,6 +14,7 @@ pub fn for_mode(mode: Mode) -> Keymap {
     match mode {
         Mode::Main => main(),
         Mode::Prompt => prompt(),
+        Mode::Input => input(),
     }
 }
 
@@ -51,6 +52,7 @@ fn main() -> Keymap {
         bind(Action::AgentAdd, "a"),
         bind(Action::AgentRemove, "x"),
         bind(Action::NewSshKey, "n"),
+        bind(Action::SshCopyId, "c"),
         // GPG keys. `n` and `x` are shared with SSH: each section acts on its
         // own list, and no section has both bindings live at once.
         bind(Action::NewGpgKey, "n"),
@@ -59,6 +61,10 @@ fn main() -> Keymap {
         bind(Action::GpgExport, "y"),
         bind(Action::GpgPublish, "p"),
         bind(Action::ToggleGpgFilter, "f"),
+        // `i` and `/` read as import and search; `c` is free in this section
+        // because ssh-copy-id belongs to the other one.
+        bind(Action::GpgImport, "i"),
+        bind(Action::GpgSearch, "/"),
     ])
 }
 
@@ -73,6 +79,30 @@ fn prompt() -> Keymap {
         bind(Action::Choose1, "1"),
         bind(Action::Choose2, "2"),
         bind(Action::Choose3, "3"),
+    ])
+}
+
+/// The text field.
+///
+/// Only keys that cannot be typed are bound: everything printable has to stay
+/// available as literal text, which is why there is no `q` to quit and no
+/// single-letter anything here. The emacs pairs (`ctrl+a`/`ctrl+e`,
+/// `ctrl+w`, `ctrl+u`) are the ones a shell has trained everyone on.
+fn input() -> Keymap {
+    Keymap(vec![
+        bind(Action::Confirm, "enter"),
+        bind(Action::Cancel, "esc"),
+        bind(Action::Cancel, "ctrl+c"),
+        bind(Action::Backspace, "backspace"),
+        bind(Action::DeleteChar, "delete"),
+        bind(Action::CursorLeft, "left"),
+        bind(Action::CursorRight, "right"),
+        bind(Action::CursorHome, "home"),
+        bind(Action::CursorHome, "ctrl+a"),
+        bind(Action::CursorEnd, "end"),
+        bind(Action::CursorEnd, "ctrl+e"),
+        bind(Action::DeleteWord, "ctrl+w"),
+        bind(Action::ClearBefore, "ctrl+u"),
     ])
 }
 

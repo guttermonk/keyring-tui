@@ -10,5 +10,5 @@ pub mod defaults;
 pub mod keymap;
 
 pub use action::{Action, Mode};
-pub use combo::ModifiedKey;
+pub use combo::{Key, ModifiedKey};
 pub use keymap::{KeymapSection, Keymaps, Resolution};

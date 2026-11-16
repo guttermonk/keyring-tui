@@ -6,6 +6,7 @@
 mod app;
 mod backend;
 mod config;
+mod input;
 mod keys;
 mod model;
 mod ui;

@@ -56,6 +56,7 @@ In **SSH Keys**:
 | `a` | add the selected key to the agent (runs `ssh-add`) |
 | `x` | remove the selected key from the agent |
 | `n` | generate a key (runs `ssh-keygen`) |
+| `c` | copy the public key to a host — asks for `[user@]host` (`ssh-copy-id`) |
 
 In **GPG Keys**:
 
@@ -67,6 +68,18 @@ In **GPG Keys**:
 | `p` | publish to a keyserver — asks first |
 | `x` | delete the key — asks first |
 | `f` | show all keys / only keys with a private half |
+| `i` | import keys from a file — asks for a path (`gpg --import`) |
+| `/` | search a keyserver — asks for a query (`gpg --search-keys`) |
+
+A key that opens a text field puts the keymap into **`input` mode**, where
+printable keys are literal text rather than bindings — so `q` types a `q`
+instead of quitting. Editing uses the shell's keys: `ctrl+w` deletes a word,
+`ctrl+u` clears to the start, `ctrl+a`/`ctrl+e` jump to either end. `Enter`
+runs, `Esc` cancels, and an empty field just closes.
+
+The field is deliberately **never** a passphrase box. Everything needing a
+secret hands the terminal to pinentry, `ssh-add` or `gpg`, so there is no
+masked mode and no buffer a secret could land in.
 
 ## Desktop entry
 
@@ -146,7 +159,8 @@ change stop a key manager from starting.
 keyring-tui theme         # every slot, its resolved value, and where it came from
 ```
 
-**Keybindings.** Two modes (`main`, `prompt`), four tables each, applied in
+**Keybindings.** Three modes (`main`, `prompt`, `input`), four tables each,
+applied in
 order: `base` replaces the defaults, `set` gives actions exactly these keys,
 `extra` layers keys on top, `unbind` vetoes. So to navigate with `n`/`e`/`i`/`o`
 instead of `h`/`j`/`k`/`l`:
@@ -247,7 +261,7 @@ reimplementing gpg's prompts would be both more code and less safe.
 - [x] add to the agent (`ssh-add`) and remove from it (agent protocol)
 - [x] generate a key (ed25519 / ecdsa p521 / rsa 4096, via `ssh-keygen`)
 - [ ] change or remove a key's passphrase
-- [ ] deploy a public key to a remote host (`ssh-copy-id`)
+- [x] deploy a public key to a remote host (`ssh-copy-id`)
 - [ ] delete a key
 - [ ] copy the public key or fingerprint to the clipboard
 
@@ -261,7 +275,7 @@ reimplementing gpg's prompts would be both more code and less safe.
 - [x] edit — trust, expiry, user IDs, revocation, certifying (`gpg --edit-key`)
 - [x] print the armoured public key
 - [x] publish to a keyserver, and delete a key, both behind a confirmation
-- [ ] import from a file, and keyserver search (both need a text input widget)
+- [x] import from a file, and keyserver search
 - [ ] per-user-ID signature listing, which is Seahorse's "Signatures" tab
 - [ ] photo IDs
 - [ ] S/MIME keys, which gpgme exposes through `Protocol::CMS`

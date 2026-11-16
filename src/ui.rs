@@ -14,7 +14,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 
-use crate::app::{App, Pane, Prompt};
+use crate::app::{App, Pane, Prompt, Question};
 use crate::config::theme::Palette;
 use crate::keys::{Action, Mode};
 use crate::model::{AgentStatus, Section, format_timestamp};
@@ -44,8 +44,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, p: &Palette) {
 
     draw_status(frame, status_area, app, p);
 
-    if let Some(prompt) = app.prompt {
-        draw_prompt(frame, frame.area(), app, prompt, p);
+    match app.prompt {
+        Some(Prompt::Ask(question)) => draw_input(frame, frame.area(), app, question, p),
+        Some(prompt) => draw_prompt(frame, frame.area(), app, prompt, p),
+        None => {}
     }
     if app.show_help {
         draw_help(frame, frame.area(), app, p);
@@ -596,6 +598,77 @@ fn hint_line(app: &App) -> String {
     parts.join("  ")
 }
 
+/// A one-line text field, with a real terminal cursor in it.
+///
+/// `set_cursor_position` rather than a drawn block, so the cursor blinks and
+/// behaves the way the terminal's own does — including for anyone reading the
+/// screen with a tool that tracks it.
+fn draw_input(frame: &mut Frame, area: Rect, app: &App, question: Question, p: &Palette) {
+    let prose: Vec<&str> = question.describe().lines().collect();
+    let label = question.label();
+
+    // Prose, a blank line, the field, a blank line, the keys.
+    let height = (prose.len() as u16 + 5).min(area.height);
+    let popup = centered(area, 72, height);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .title(question.title())
+        .border_style(Style::default().fg(p.accent));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [prose_area, field_area, keys_area] = Layout::vertical([
+        Constraint::Length(prose.len() as u16 + 1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+
+    let prose_lines: Vec<Line> = prose
+        .iter()
+        .map(|line| Line::styled((*line).to_string(), p.dim_style()))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(prose_lines)), prose_area);
+
+    // `label: ` sits in front of the field, so the text starts after it.
+    let prefix = format!("{label}: ");
+    let prefix_width = prefix.chars().count() as u16;
+    let field_width = field_area.width.saturating_sub(prefix_width);
+    let (text, cursor) = app.input.visible(field_width);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prefix, p.dim_style()),
+            Span::raw(text.to_string()),
+        ])),
+        field_area,
+    );
+    frame.set_cursor_position((field_area.x + prefix_width + cursor, field_area.y));
+
+    let map = app.keymaps().get(Mode::Input);
+    let keys = |action: Action| -> String {
+        map.combos_for(action)
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".into())
+    };
+    // An empty field has nothing to run, and Enter just closes the box —
+    // say so rather than offering an action that will not happen.
+    let confirm = if app.input.is_empty() {
+        format!(" {} close", keys(Action::Confirm))
+    } else {
+        format!(" {} run", keys(Action::Confirm))
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!("{confirm}   {} cancel", keys(Action::Cancel)),
+            p.dim_style(),
+        )),
+        keys_area,
+    );
+}
+
 fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt, p: &Palette) {
     // Confirmations name the key they are about, so there is no doubt which
     // one is about to be deleted or published.
@@ -605,6 +678,8 @@ fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt, p: &Pal
         .unwrap_or_default();
 
     let (title, body) = match prompt {
+        // Routed to `draw_input` before this is called.
+        Prompt::Ask(_) => return,
         Prompt::NewSshKey => (" New SSH key ".to_string(), NEW_SSH_KEY_PROMPT.to_string()),
         Prompt::ConfirmGpgDelete => (
             " Delete key ".to_string(),
@@ -619,6 +694,8 @@ fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt, p: &Pal
     // The prose is written out; the keys come from the prompt keymap, so a
     // rebound confirmation does not leave the modal advertising `y`.
     let choices: &[(Action, &str)] = match prompt {
+        // Routed to `draw_input` before this is called.
+        Prompt::Ask(_) => return,
         Prompt::NewSshKey => &[
             (Action::Choose1, "ed25519        (recommended)"),
             (Action::Choose2, "ecdsa p521"),

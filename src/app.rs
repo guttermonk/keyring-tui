@@ -17,7 +17,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
 
 use crate::backend::{GpgRequest, Refresh, Reply, SecretsRequest, SshRequest};
-use crate::keys::{Action, Keymaps, Mode, ModifiedKey, Resolution};
+use crate::input::Input;
+use crate::keys::{Action, Key, Keymaps, Mode, ModifiedKey, Resolution};
 use crate::model::{
     AgentStatus, GpgFilter, GpgKeyInfo, ItemInfo, KeyringInfo, Section, SshKeyInfo,
 };
@@ -55,6 +56,58 @@ pub enum Prompt {
     /// Confirm publishing the selected GPG key to a keyserver. Keyservers do
     /// not forget, so this one is not undoable.
     ConfirmGpgPublish,
+    /// A one-line text field. The text itself lives in [`App::input`] so that
+    /// this enum stays `Copy`.
+    Ask(Question),
+}
+
+/// What a text field is being used to ask for.
+///
+/// Every variant feeds an external command, so none of them ever asks for a
+/// secret — see [`crate::input`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Question {
+    /// A file to import keys from: `gpg --import <path>`.
+    GpgImportPath,
+    /// A name or address to look for on a keyserver:
+    /// `gpg --search-keys <query>`, which then asks which to import.
+    GpgSearch,
+    /// Where to install the selected public key: `ssh-copy-id <target>`.
+    SshCopyTarget,
+}
+
+impl Question {
+    /// The modal's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::GpgImportPath => " Import keys from a file ",
+            Self::GpgSearch => " Search a keyserver ",
+            Self::SshCopyTarget => " Copy this key to a host ",
+        }
+    }
+
+    /// The line above the field, saying what will run.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::GpgImportPath => "Runs gpg --import. A file of one or more public keys.",
+            Self::GpgSearch => {
+                "Runs gpg --search-keys, which lists matches and asks which to import."
+            }
+            Self::SshCopyTarget => {
+                "Runs ssh-copy-id, which appends the public key to the host's\n\
+                 authorized_keys. It will ask the host for a password."
+            }
+        }
+    }
+
+    /// The prompt shown in front of the field.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GpgImportPath => "path",
+            Self::GpgSearch => "search",
+            Self::SshCopyTarget => "[user@]host",
+        }
+    }
 }
 
 /// A `gpg` invocation. Everything that changes a key goes through the CLI so
@@ -74,6 +127,11 @@ pub enum GpgAction {
     /// at `--delete-secret-keys`, which is the safe default here: losing a
     /// public key is recoverable, losing a private one is not.
     Delete,
+    /// `--import <path>`, which reports what it added and skipped.
+    Import,
+    /// `--search-keys <query>`: gpg lists what the keyserver has and asks
+    /// which to import, so the choosing happens in gpg rather than here.
+    Search,
 }
 
 impl GpgAction {
@@ -84,6 +142,8 @@ impl GpgAction {
             Self::Export => vec!["--armor".into(), "--export".into()],
             Self::Publish => vec!["--send-keys".into()],
             Self::Delete => vec!["--delete-key".into()],
+            Self::Import => vec!["--import".into()],
+            Self::Search => vec!["--search-keys".into()],
         };
         if let Some(fingerprint) = fingerprint {
             args.push(fingerprint.to_owned());
@@ -114,6 +174,9 @@ pub enum External {
         action: GpgAction,
         fingerprint: Option<String>,
     },
+    /// `ssh-copy-id -i <public_key> <target>`, which asks the remote host for
+    /// a password itself.
+    SshCopyId { public_key: PathBuf, target: String },
 }
 
 impl External {
@@ -121,6 +184,7 @@ impl External {
         match self {
             Self::SshAdd(_) => "ssh-add",
             Self::SshKeygen { .. } => "ssh-keygen",
+            Self::SshCopyId { .. } => "ssh-copy-id",
             Self::Gpg { .. } => "gpg",
         }
     }
@@ -140,6 +204,13 @@ impl External {
                 action,
                 fingerprint,
             } => action.args(fingerprint.as_deref()),
+            Self::SshCopyId { public_key, target } => {
+                vec![
+                    "-i".to_string(),
+                    public_key.display().to_string(),
+                    target.clone(),
+                ]
+            }
         }
     }
 
@@ -151,7 +222,7 @@ impl External {
     /// What this command may have changed, so the right list is re-read.
     pub fn refresh(&self) -> Refresh {
         match self {
-            Self::SshAdd(_) | Self::SshKeygen { .. } => Refresh::SshKeys,
+            Self::SshAdd(_) | Self::SshKeygen { .. } | Self::SshCopyId { .. } => Refresh::SshKeys,
             Self::Gpg { .. } => Refresh::GpgKeys,
         }
     }
@@ -202,6 +273,8 @@ pub struct App {
     pub error: Option<String>,
     pub show_help: bool,
     pub prompt: Option<Prompt>,
+    /// The text field, live only while `prompt` is `Prompt::Ask`.
+    pub input: Input,
     pub should_quit: bool,
 
     external: Option<External>,
@@ -243,6 +316,7 @@ impl App {
             error: None,
             show_help: false,
             prompt: None,
+            input: Input::default(),
             should_quit: false,
             detail_scroll: 0,
             detail_lines: 0,
@@ -340,10 +414,10 @@ impl App {
 
     /// Which keymap a keypress is resolved against right now.
     pub fn mode(&self) -> Mode {
-        if self.prompt.is_some() {
-            Mode::Prompt
-        } else {
-            Mode::Main
+        match self.prompt {
+            Some(Prompt::Ask(_)) => Mode::Input,
+            Some(_) => Mode::Prompt,
+            None => Mode::Main,
         }
     }
 
@@ -377,7 +451,24 @@ impl App {
         match resolution {
             // A longer chord starts here; wait for the rest.
             Resolution::Pending => {}
-            Resolution::None => self.pending.clear(),
+            Resolution::None => {
+                self.pending.clear();
+                // In a text field anything the keymap does not claim is
+                // literal text. Modified keys are excluded: ctrl+j is a
+                // binding someone may add, not a `j` to type. Shift is not,
+                // since that is how capitals arrive.
+                if mode == Mode::Input
+                    && !pressed.mods.ctrl
+                    && !pressed.mods.alt
+                    && !pressed.mods.super_
+                {
+                    match pressed.key {
+                        Key::Char(c) => self.input.insert(c),
+                        Key::Space => self.input.insert(' '),
+                        _ => {}
+                    }
+                }
+            }
             Resolution::Exact(action) => {
                 self.pending.clear();
                 self.dispatch(mode, action);
@@ -386,6 +477,10 @@ impl App {
     }
 
     fn dispatch(&mut self, mode: Mode, action: Action) {
+        if mode == Mode::Input {
+            self.dispatch_input(action);
+            return;
+        }
         if mode == Mode::Prompt {
             self.dispatch_prompt(action);
             return;
@@ -414,6 +509,7 @@ impl App {
             Action::ToggleSecret => self.toggle_secret(),
 
             Action::AgentAdd => self.add_to_agent(),
+            Action::SshCopyId => self.copy_key_to_host(),
             Action::AgentRemove => self.remove_from_agent(),
             Action::NewSshKey => {
                 if self.section == Section::SshKeys {
@@ -423,6 +519,21 @@ impl App {
 
             Action::GpgEdit => self.edit_gpg_key(),
             Action::GpgExport => self.export_gpg_key(),
+            Action::GpgImport => {
+                if self.section == Section::GpgKeys {
+                    // Pre-filled with the home directory, which is where a
+                    // downloaded key usually lands and saves typing the stem.
+                    let home = dirs::home_dir()
+                        .map(|path| format!("{}/", path.display()))
+                        .unwrap_or_default();
+                    self.ask(Question::GpgImportPath, &home);
+                }
+            }
+            Action::GpgSearch => {
+                if self.section == Section::GpgKeys {
+                    self.ask(Question::GpgSearch, "");
+                }
+            }
             Action::GpgPublish => self.confirm(Prompt::ConfirmGpgPublish),
             Action::GpgDelete => self.confirm(Prompt::ConfirmGpgDelete),
             // gpg --full-generate-key asks everything itself, so there is
@@ -430,8 +541,17 @@ impl App {
             Action::NewGpgKey => self.run_gpg(GpgAction::Generate, None),
             Action::ToggleGpgFilter => self.toggle_gpg_filter(),
 
-            // Prompt-only; harmless if someone binds them in the main map.
-            Action::Confirm
+            // Prompt- and field-only; harmless if someone binds them in the
+            // main map, where they have nothing to act on.
+            Action::Backspace
+            | Action::DeleteChar
+            | Action::CursorLeft
+            | Action::CursorRight
+            | Action::CursorHome
+            | Action::CursorEnd
+            | Action::DeleteWord
+            | Action::ClearBefore
+            | Action::Confirm
             | Action::Cancel
             | Action::Choose1
             | Action::Choose2
@@ -445,6 +565,8 @@ impl App {
         };
 
         match prompt {
+            // Handled by `dispatch_input`; this arm keeps the match total.
+            Prompt::Ask(_) => {}
             Prompt::NewSshKey => match action {
                 // Enter picks the recommended algorithm, like a default
                 // button; the numbers pick explicitly.
@@ -473,6 +595,73 @@ impl App {
                 _ => {}
             },
         }
+    }
+
+    /// Editing keys in a text field, plus the two that end it.
+    fn dispatch_input(&mut self, action: Action) {
+        let Some(Prompt::Ask(question)) = self.prompt else {
+            return;
+        };
+
+        match action {
+            Action::Confirm => self.submit_input(question),
+            Action::Cancel => {
+                self.input = Input::default();
+                self.cancel_prompt();
+            }
+            Action::Backspace => self.input.backspace(),
+            Action::DeleteChar => self.input.delete(),
+            Action::CursorLeft => self.input.left(),
+            Action::CursorRight => self.input.right(),
+            Action::CursorHome => self.input.home(),
+            Action::CursorEnd => self.input.end(),
+            Action::DeleteWord => self.input.delete_word_before(),
+            Action::ClearBefore => self.input.clear_before(),
+            _ => {}
+        }
+    }
+
+    /// Turn the typed answer into the command it was asked for.
+    ///
+    /// An empty field is a no-op rather than an error: it is what someone
+    /// pressing Enter to dismiss the box means, and `gpg --import ""` is not
+    /// a thing worth running.
+    fn submit_input(&mut self, question: Question) {
+        let answer = self.input.value().trim().to_string();
+        if answer.is_empty() {
+            self.input = Input::default();
+            self.cancel_prompt();
+            return;
+        }
+
+        self.prompt = None;
+        self.input = Input::default();
+
+        match question {
+            Question::GpgImportPath => self.run_gpg(GpgAction::Import, Some(answer)),
+            Question::GpgSearch => self.run_gpg(GpgAction::Search, Some(answer)),
+            Question::SshCopyTarget => {
+                // The key to install comes from the cursor, not the field —
+                // the field only answers "to where".
+                let Some(path) = self
+                    .selected_ssh_key()
+                    .and_then(|key| key.public_path.clone())
+                else {
+                    self.status = "that key has no public half to copy".into();
+                    return;
+                };
+                self.external = Some(External::SshCopyId {
+                    public_key: path,
+                    target: answer,
+                });
+            }
+        }
+    }
+
+    /// Open a text field asking `question`, pre-filled with `initial`.
+    fn ask(&mut self, question: Question, initial: &str) {
+        self.input = Input::new(initial);
+        self.prompt = Some(Prompt::Ask(question));
     }
 
     fn cancel_prompt(&mut self) {
@@ -739,6 +928,24 @@ impl App {
         }
         self.status = format!("removing {name} from the agent…");
         self.send_ssh(SshRequest::RemoveFromAgent { key: id });
+    }
+
+    /// Ask where to install the selected key's public half.
+    fn copy_key_to_host(&mut self) {
+        if self.section != Section::SshKeys {
+            return;
+        }
+        let Some(key) = self.selected_ssh_key() else {
+            return;
+        };
+        // An agent-only identity has no `.pub` on disk for ssh-copy-id to
+        // read, so there is nothing to offer.
+        if key.public_path.is_none() {
+            let name = key.name.clone();
+            self.status = format!("{name} has no public key file to copy");
+            return;
+        }
+        self.ask(Question::SshCopyTarget, "");
     }
 
     fn generate_ssh_key(&mut self, algorithm: &'static str, bits: Option<u32>) {
@@ -1967,6 +2174,222 @@ mod tests {
             harness.app.prompt.is_none(),
             "n is navigation now, not new-key"
         );
+    }
+
+    // --- Text fields -----------------------------------------------------
+
+    /// Type a string into whatever field is open.
+    fn type_text(harness: &mut Harness, text: &str) {
+        for c in text.chars() {
+            harness.press(KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn opening_a_field_switches_the_keymap_to_input_mode() {
+        let mut harness = Harness::gpg_loaded();
+        assert_eq!(harness.app.mode(), Mode::Main);
+
+        harness.press(KeyCode::Char('/'));
+        assert_eq!(harness.app.prompt, Some(Prompt::Ask(Question::GpgSearch)));
+        assert_eq!(
+            harness.app.mode(),
+            Mode::Input,
+            "a field resolves keys against its own map"
+        );
+    }
+
+    #[test]
+    fn printable_keys_are_text_not_bindings() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('/'));
+
+        // Every one of these is a binding in the main map: q quits, x deletes,
+        // n generates, 1/2/3 switch section. In a field they are just letters.
+        type_text(&mut harness, "qxn123 greg@example");
+
+        assert_eq!(harness.app.input.value(), "qxn123 greg@example");
+        assert!(!harness.app.should_quit, "q must not quit while typing");
+        assert_eq!(
+            harness.app.section,
+            Section::GpgKeys,
+            "digits must not switch"
+        );
+        assert!(harness.app.take_external().is_none());
+    }
+
+    #[test]
+    fn a_space_is_typed_rather_than_swallowed() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "two words");
+        assert_eq!(harness.app.input.value(), "two words");
+    }
+
+    #[test]
+    fn editing_keys_still_work_inside_a_field() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "greg@exampel");
+
+        harness.press(KeyCode::Backspace);
+        harness.press(KeyCode::Backspace);
+        type_text(&mut harness, "le");
+        assert_eq!(harness.app.input.value(), "greg@example");
+
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(harness.app.input.value(), "", "ctrl+u clears to the start");
+    }
+
+    #[test]
+    fn a_modified_key_is_a_binding_not_a_letter() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "abc def");
+
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            harness.app.input.value(),
+            "abc ",
+            "ctrl+w deleted a word rather than typing a w"
+        );
+    }
+
+    #[test]
+    fn submitting_runs_the_command_with_what_was_typed() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "greg@example.com");
+        harness.press(KeyCode::Enter);
+
+        assert_eq!(harness.app.prompt, None);
+        let external = harness.app.take_external().expect("external parked");
+        assert_eq!(
+            external.describe(),
+            "gpg --search-keys greg@example.com",
+            "the typed text becomes the argument"
+        );
+        assert!(
+            harness.app.input.value().is_empty(),
+            "the field is cleared for next time"
+        );
+    }
+
+    #[test]
+    fn the_import_field_is_prefilled_and_editable() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('i'));
+        assert_eq!(
+            harness.app.prompt,
+            Some(Prompt::Ask(Question::GpgImportPath))
+        );
+
+        // Offered a default with the cursor at the end, so typing extends it.
+        let offered = harness.app.input.value().to_string();
+        assert!(
+            offered.ends_with('/'),
+            "a directory to continue from: {offered:?}"
+        );
+        type_text(&mut harness, "key.asc");
+        harness.press(KeyCode::Enter);
+
+        let external = harness.app.take_external().expect("external parked");
+        assert_eq!(
+            external.describe(),
+            format!("gpg --import {offered}key.asc")
+        );
+    }
+
+    #[test]
+    fn an_empty_field_closes_without_running_anything() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('/'));
+        harness.press(KeyCode::Enter);
+
+        assert_eq!(harness.app.prompt, None);
+        assert!(
+            harness.app.take_external().is_none(),
+            "gpg --search-keys \"\" is not worth running"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_counts_as_empty() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "   ");
+        harness.press(KeyCode::Enter);
+        assert!(harness.app.take_external().is_none());
+    }
+
+    #[test]
+    fn cancelling_discards_the_text() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "half typed");
+        harness.press(KeyCode::Esc);
+
+        assert_eq!(harness.app.prompt, None);
+        assert_eq!(harness.app.mode(), Mode::Main);
+        assert!(harness.app.input.value().is_empty());
+        assert!(harness.app.take_external().is_none());
+
+        // And the main keymap is live again.
+        harness.press(KeyCode::Char('q'));
+        assert!(harness.app.should_quit);
+    }
+
+    #[test]
+    fn ssh_copy_id_takes_the_target_from_the_field_and_the_key_from_the_cursor() {
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('c'));
+        assert_eq!(
+            harness.app.prompt,
+            Some(Prompt::Ask(Question::SshCopyTarget))
+        );
+
+        type_text(&mut harness, "greg@nas");
+        harness.press(KeyCode::Enter);
+
+        let external = harness.app.take_external().expect("external parked");
+        assert_eq!(
+            external.describe(),
+            "ssh-copy-id -i /home/u/.ssh/id_ecdsa.pub greg@nas"
+        );
+        assert_eq!(external.refresh(), Refresh::SshKeys);
+    }
+
+    #[test]
+    fn a_key_with_no_public_half_cannot_be_copied() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('3'));
+        let mut key = ssh_key(0, "forwarded", false, true);
+        key.public_path = None;
+        harness.app.on_reply(Reply::SshKeys {
+            keys: vec![key],
+            agent: AgentStatus::Ready { loaded: 1 },
+        });
+
+        harness.press(KeyCode::Char('c'));
+        assert!(harness.app.prompt.is_none(), "nothing to ask about");
+        assert!(harness.app.status.contains("no public key file"));
+    }
+
+    #[test]
+    fn field_keys_do_nothing_in_the_main_view() {
+        let mut harness = Harness::gpg_loaded();
+        // No field open: these must not be swallowed or crash.
+        harness.press(KeyCode::Backspace);
+        harness.press(KeyCode::Delete);
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(harness.app.input.value().is_empty());
+        assert!(harness.app.prompt.is_none());
     }
 
     // --- Shared chrome ---------------------------------------------------
