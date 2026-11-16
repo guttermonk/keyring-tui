@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! Colour themes.
 //!
 //! The syntax matches lazysync's: a `preset`, plus per-slot overrides in hex

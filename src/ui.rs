@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! Rendering.
 //!
 //! A function of the app state and the resolved [`Palette`], with one

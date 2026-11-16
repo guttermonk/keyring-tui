@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! Smoke test against a real `org.freedesktop.secrets` on the session bus.
 //!
 //! Ignored by default: it needs a running keyring daemon and reports on the

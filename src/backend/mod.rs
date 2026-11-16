@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! Backends own all I/O and run off the UI task.
 //!
 //! Each backend is an actor: it receives a request, does the blocking or async

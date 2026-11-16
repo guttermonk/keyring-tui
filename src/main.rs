@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! keyring-tui — a terminal replacement for GNOME Seahorse.
 
 mod app;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! Domain types shared between the backends and the UI.
 //!
 //! Backends translate their native objects (Secret Service items, GPG keys,

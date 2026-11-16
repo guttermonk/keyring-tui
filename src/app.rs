@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! Application state and the key handling that mutates it.
 //!
 //! `App` is deliberately synchronous and I/O-free: every key press either

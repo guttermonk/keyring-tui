@@ -296,4 +296,4 @@ cargo run
 
 ## License
 
-GPL-3.0-or-later, matching Seahorse.
+GPL-3.0-or-later, matching Seahorse. Full text in [LICENSE](LICENSE).

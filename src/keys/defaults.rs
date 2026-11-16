@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! The built-in keymap.
 //!
 //! vim keys first, with arrows and the obvious named keys alongside, so the

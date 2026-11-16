@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! Secret Service backend — the `Passwords` section.
 //!
 //! Talks to `org.freedesktop.secrets` (gnome-keyring-daemon, KWallet, or

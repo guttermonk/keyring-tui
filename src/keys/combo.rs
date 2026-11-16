@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! Key combinations as they appear in config and on screen.
 //!
 //! The spelling follows lazysync's, so a keymap written for one reads the

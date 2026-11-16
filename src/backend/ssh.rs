@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! SSH backend — the `SSH Keys` section.
 //!
 //! Three sources of truth, merged into one list:

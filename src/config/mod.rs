@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 guttermonk <guttermonk@protonmail.com>
+
 //! Configuration: `$XDG_CONFIG_HOME/keyring-tui/config.toml`.
 //!
 //! A missing file is not an error — keyring-tui is usable with no config at
