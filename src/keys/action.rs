@@ -72,6 +72,8 @@ pub enum Action {
     Unlock,
     Lock,
     ToggleSecret,
+    FilterItems,
+    DeleteItem,
 
     // SSH keys.
     AgentAdd,
@@ -129,6 +131,8 @@ impl Action {
             Self::Unlock => "unlock the selected keyring",
             Self::Lock => "lock the selected keyring",
             Self::ToggleSecret => "reveal / hide the secret",
+            Self::FilterItems => "filter the item list",
+            Self::DeleteItem => "delete the stored secret",
             Self::AgentAdd => "add to the ssh-agent (runs ssh-add)",
             Self::AgentRemove => "remove from the ssh-agent",
             Self::NewSshKey => "new SSH key (runs ssh-keygen)",
@@ -160,7 +164,11 @@ impl Action {
     /// Which section an action belongs to. `None` means it works everywhere.
     pub fn section(self) -> Option<Section> {
         match self {
-            Self::Unlock | Self::Lock | Self::ToggleSecret => Some(Section::Keyrings),
+            Self::Unlock
+            | Self::Lock
+            | Self::ToggleSecret
+            | Self::FilterItems
+            | Self::DeleteItem => Some(Section::Keyrings),
             Self::AgentAdd | Self::AgentRemove | Self::NewSshKey | Self::SshCopyId => {
                 Some(Section::SshKeys)
             }

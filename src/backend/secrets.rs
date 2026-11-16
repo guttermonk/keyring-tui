@@ -75,6 +75,7 @@ impl State {
             SecretsRequest::Unlock { keyring } => self.set_locked(keyring, false).await,
             SecretsRequest::Lock { keyring } => self.set_locked(keyring, true).await,
             SecretsRequest::RevealSecret { keyring, item } => self.reveal(keyring, item).await,
+            SecretsRequest::DeleteItem { keyring, item } => self.delete_item(keyring, item).await,
         }
     }
 
@@ -187,6 +188,30 @@ impl State {
         Ok(Reply::Status {
             message: format!("{label} {}", if locked { "locked" } else { "unlocked" }),
             // Lock state changed, so the keyring list and its items are stale.
+            refresh: Refresh::Keyrings,
+        })
+    }
+
+    /// Delete one item, and report its label so the status line can name
+    /// what went — read before the delete, since afterwards there is nothing
+    /// left to ask.
+    async fn delete_item(&mut self, keyring: usize, item: usize) -> Result<Reply, String> {
+        let handle = self
+            .items
+            .get(keyring)
+            .and_then(|items| items.get(item))
+            .ok_or_else(|| stale("item"))?;
+
+        let label = handle.label().await.unwrap_or_else(|_| "the item".into());
+        handle
+            .delete(None)
+            .await
+            .map_err(|err| format!("deleting {label} failed: {err}"))?;
+
+        Ok(Reply::Status {
+            message: format!("deleted {label}"),
+            // The item table this backend holds is now one short, so the
+            // whole keyring is re-read rather than patched.
             refresh: Refresh::Keyrings,
         })
     }

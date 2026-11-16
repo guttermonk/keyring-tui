@@ -40,6 +40,12 @@ pub enum SecretsRequest {
         keyring: usize,
         item: usize,
     },
+    /// Delete one stored secret. Gated behind a confirmation in the UI: the
+    /// Secret Service has no undo and no trash, so this is the real thing.
+    DeleteItem {
+        keyring: usize,
+        item: usize,
+    },
 }
 
 /// Commands for the GPG backend.

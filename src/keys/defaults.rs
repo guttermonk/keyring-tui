@@ -48,6 +48,10 @@ fn main() -> Keymap {
         bind(Action::Unlock, "u"),
         bind(Action::Lock, "L"),
         bind(Action::ToggleSecret, "s"),
+        // `/` filters here and searches a keyserver in GPG; `x` deletes in
+        // all three sections. Section-aware resolution keeps them apart.
+        bind(Action::FilterItems, "/"),
+        bind(Action::DeleteItem, "x"),
         // SSH keys.
         bind(Action::AgentAdd, "a"),
         bind(Action::AgentRemove, "x"),

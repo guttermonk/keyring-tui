@@ -48,6 +48,8 @@ In **Passwords**:
 | `h`/`l` | focus keyrings / items |
 | `u` / `L` | unlock / lock the selected keyring |
 | `s` | reveal / hide the selected secret |
+| `/` | filter the item list by label or attribute — empty clears it |
+| `x` | delete the selected secret — asks first |
 
 In **SSH Keys**:
 
@@ -75,7 +77,8 @@ A key that opens a text field puts the keymap into **`input` mode**, where
 printable keys are literal text rather than bindings — so `q` types a `q`
 instead of quitting. Editing uses the shell's keys: `ctrl+w` deletes a word,
 `ctrl+u` clears to the start, `ctrl+a`/`ctrl+e` jump to either end. `Enter`
-runs, `Esc` cancels, and an empty field just closes.
+runs, `Esc` cancels, and an empty field just closes — except the item
+filter, where an empty field means "show everything again".
 
 The field is deliberately **never** a passphrase box. Everything needing a
 secret hands the terminal to pinentry, `ssh-add` or `gpg`, so there is no
@@ -248,10 +251,16 @@ reimplementing gpg's prompts would be both more code and less safe.
 - [x] list items with schema, timestamps and attributes
 - [x] reveal a secret on demand
 - [x] lock and unlock a keyring
-- [ ] create, edit and delete items
-- [ ] create and delete keyrings; change a keyring passphrase
-- [ ] search and filter
+- [x] delete an item, behind a confirmation
+- [x] filter the item list by label or attribute
+- [ ] create and edit items
+- [ ] create and delete keyrings
 - [ ] copy a secret to the clipboard with a timed clear
+
+Changing a keyring's passphrase is not on this list: the Secret Service
+spec has no method for it. Seahorse does it through gnome-keyring's own
+D-Bus interface, which only gnome-keyring implements — so `gnome-keyring`
+or `secret-tool` remains the way to do that.
 
 **SSH keys**
 

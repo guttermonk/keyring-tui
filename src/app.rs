@@ -56,6 +56,9 @@ pub enum Prompt {
     /// Confirm publishing the selected GPG key to a keyserver. Keyservers do
     /// not forget, so this one is not undoable.
     ConfirmGpgPublish,
+    /// Confirm deleting the selected stored secret. Nothing else asks: the
+    /// Secret Service deletes on request, with no trash to recover from.
+    ConfirmDeleteItem,
     /// A one-line text field. The text itself lives in [`App::input`] so that
     /// this enum stays `Copy`.
     Ask(Question),
@@ -74,6 +77,8 @@ pub enum Question {
     GpgSearch,
     /// Where to install the selected public key: `ssh-copy-id <target>`.
     SshCopyTarget,
+    /// A substring to narrow the item list by.
+    ItemFilter,
 }
 
 impl Question {
@@ -83,6 +88,7 @@ impl Question {
             Self::GpgImportPath => " Import keys from a file ",
             Self::GpgSearch => " Search a keyserver ",
             Self::SshCopyTarget => " Copy this key to a host ",
+            Self::ItemFilter => " Filter items ",
         }
     }
 
@@ -97,6 +103,10 @@ impl Question {
                 "Runs ssh-copy-id, which appends the public key to the host's\n\
                  authorized_keys. It will ask the host for a password."
             }
+            Self::ItemFilter => {
+                "Narrows the list to items whose label or attributes contain\n\
+                 this text. Empty shows everything again."
+            }
         }
     }
 
@@ -106,6 +116,7 @@ impl Question {
             Self::GpgImportPath => "path",
             Self::GpgSearch => "search",
             Self::SshCopyTarget => "[user@]host",
+            Self::ItemFilter => "match",
         }
     }
 }
@@ -237,6 +248,11 @@ pub struct App {
     pub keyring_state: ListState,
     pub items: Vec<ItemInfo>,
     pub item_state: ListState,
+    /// A substring the item list is narrowed to, empty when showing
+    /// everything. A view over `items` rather than a backend query: keyrings
+    /// hold tens of items, not thousands, and filtering locally keeps the
+    /// `ItemInfo::id` the backend handed us intact.
+    pub item_filter: String,
 
     /// The currently displayed secret, if the user asked for it. Held in a
     /// `Zeroizing` so it is wiped when cleared, and cleared on *any*
@@ -302,6 +318,7 @@ impl App {
             keyring_state: ListState::default(),
             items: Vec::new(),
             item_state: ListState::default(),
+            item_filter: String::new(),
             revealed: None,
             ssh_keys: Vec::new(),
             ssh_state: ListState::default(),
@@ -352,8 +369,46 @@ impl App {
             .and_then(|i| self.keyrings.get(i))
     }
 
+    /// The items the list is showing, after `item_filter`.
+    ///
+    /// The filter is a view, not a reload: `items` keeps every row the
+    /// backend sent and each `ItemInfo` keeps the `id` that addresses it, so
+    /// acting on a filtered row still reaches the right item.
+    pub fn visible_items(&self) -> Vec<&ItemInfo> {
+        self.items
+            .iter()
+            .filter(|item| self.item_matches(item))
+            .collect()
+    }
+
+    /// How many rows the item list is showing. Same predicate as
+    /// [`Self::visible_items`], without the allocation — the cursor and the
+    /// filtered view have to agree on the length or `G` lands off the end.
+    pub fn visible_item_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| self.item_matches(item))
+            .count()
+    }
+
+    fn item_matches(&self, item: &ItemInfo) -> bool {
+        if self.item_filter.is_empty() {
+            return true;
+        }
+        let needle = self.item_filter.to_lowercase();
+        item.label.to_lowercase().contains(&needle)
+            // Attribute values are where the useful detail hides — a URL, an
+            // account name — so they match too.
+            || item.attributes.iter().any(|(key, value)| {
+                key.to_lowercase().contains(&needle) || value.to_lowercase().contains(&needle)
+            })
+    }
+
+    /// The cursor indexes the *filtered* list, so this does too.
     pub fn selected_item(&self) -> Option<&ItemInfo> {
-        self.item_state.selected().and_then(|i| self.items.get(i))
+        self.item_state
+            .selected()
+            .and_then(|i| self.visible_items().get(i).copied())
     }
 
     pub fn selected_ssh_key(&self) -> Option<&SshKeyInfo> {
@@ -507,6 +562,15 @@ impl App {
             Action::Unlock => self.lock_selected(false),
             Action::Lock => self.lock_selected(true),
             Action::ToggleSecret => self.toggle_secret(),
+            Action::FilterItems => {
+                if self.section == Section::Keyrings {
+                    // Pre-filled with the current filter so `/` is also how
+                    // you edit or clear one.
+                    let current = self.item_filter.clone();
+                    self.ask(Question::ItemFilter, &current);
+                }
+            }
+            Action::DeleteItem => self.confirm(Prompt::ConfirmDeleteItem),
 
             Action::AgentAdd => self.add_to_agent(),
             Action::SshCopyId => self.copy_key_to_host(),
@@ -594,6 +658,14 @@ impl App {
                 Action::Cancel => self.cancel_prompt(),
                 _ => {}
             },
+            Prompt::ConfirmDeleteItem => match action {
+                Action::Confirm => {
+                    self.prompt = None;
+                    self.delete_item();
+                }
+                Action::Cancel => self.cancel_prompt(),
+                _ => {}
+            },
         }
     }
 
@@ -628,6 +700,16 @@ impl App {
     /// a thing worth running.
     fn submit_input(&mut self, question: Question) {
         let answer = self.input.value().trim().to_string();
+
+        // The filter is the one answer where empty means something: it clears
+        // the filter rather than cancelling the edit.
+        if question == Question::ItemFilter {
+            self.prompt = None;
+            self.input = Input::default();
+            self.set_item_filter(answer);
+            return;
+        }
+
         if answer.is_empty() {
             self.input = Input::default();
             self.cancel_prompt();
@@ -655,7 +737,54 @@ impl App {
                     target: answer,
                 });
             }
+            // Handled above, before the empty-answer check.
+            Question::ItemFilter => {}
         }
+    }
+
+    /// Narrow the item list, and put the cursor somewhere that exists.
+    ///
+    /// A revealed secret is hidden too: the row it belongs to may well have
+    /// just been filtered out from under it.
+    fn set_item_filter(&mut self, filter: String) {
+        self.item_filter = filter;
+        self.hide_secret();
+
+        let visible = self.visible_items().len();
+        if visible == 0 {
+            self.item_state.select(None);
+        } else {
+            let index = self.item_state.selected().unwrap_or(0).min(visible - 1);
+            self.item_state.select(Some(index));
+        }
+
+        self.status = if self.item_filter.is_empty() {
+            "filter cleared".into()
+        } else {
+            format!(
+                "{visible} of {} items match {:?}",
+                self.items.len(),
+                self.item_filter
+            )
+        };
+    }
+
+    /// Ask the backend to delete the item under the cursor.
+    ///
+    /// `ItemInfo::id` indexes the backend's own table, which is why filtering
+    /// is safe to do as a view: the row still knows what it is.
+    fn delete_item(&mut self) {
+        let Some(keyring) = self.selected_keyring().map(|keyring| keyring.id) else {
+            return;
+        };
+        let Some(item) = self.selected_item().map(|item| item.id) else {
+            return;
+        };
+        self.hide_secret();
+        let _ = self
+            .secrets
+            .send(SecretsRequest::DeleteItem { keyring, item });
+        self.status = "deleting…".into();
     }
 
     /// Open a text field asking `question`, pre-filled with `initial`.
@@ -669,15 +798,22 @@ impl App {
         self.status = "cancelled".into();
     }
 
-    /// Open a confirmation, but only when there is something to confirm.
+    /// Open a confirmation, but only when there is something to confirm —
+    /// in the right section, with a row actually selected.
     fn confirm(&mut self, prompt: Prompt) {
-        if self.section != Section::GpgKeys {
-            return;
+        let ready = match prompt {
+            Prompt::ConfirmGpgDelete | Prompt::ConfirmGpgPublish => {
+                self.section == Section::GpgKeys && self.selected_gpg_key().is_some()
+            }
+            Prompt::ConfirmDeleteItem => {
+                self.section == Section::Keyrings && self.selected_item().is_some()
+            }
+            // Neither of these is a confirmation; they are opened directly.
+            Prompt::NewSshKey | Prompt::Ask(_) => false,
+        };
+        if ready {
+            self.prompt = Some(prompt);
         }
-        if self.selected_gpg_key().is_none() {
-            return;
-        }
-        self.prompt = Some(prompt);
     }
 
     fn set_section(&mut self, section: Section) {
@@ -738,7 +874,7 @@ impl App {
         if self.pane == Pane::List
             && self.section == Section::Keyrings
             && self.item_state.selected().is_none()
-            && !self.items.is_empty()
+            && self.visible_item_count() > 0
         {
             self.item_state.select(Some(0));
         }
@@ -757,11 +893,12 @@ impl App {
         match (self.section, self.pane) {
             (Section::Keyrings, Pane::Keyrings) => {
                 if step(&mut self.keyring_state, self.keyrings.len(), delta) {
-                    self.load_selected_items();
+                    self.select_other_keyring();
                 }
             }
             (Section::Keyrings, _) => {
-                step(&mut self.item_state, self.items.len(), delta);
+                let len = self.visible_item_count();
+                step(&mut self.item_state, len, delta);
             }
             (Section::SshKeys, _) => {
                 step(&mut self.ssh_state, self.ssh_keys.len(), delta);
@@ -793,7 +930,10 @@ impl App {
         self.detail_scroll = 0;
         let (state, len) = match (self.section, self.pane) {
             (Section::Keyrings, Pane::Keyrings) => (&mut self.keyring_state, self.keyrings.len()),
-            (Section::Keyrings, _) => (&mut self.item_state, self.items.len()),
+            (Section::Keyrings, _) => {
+                let len = self.visible_item_count();
+                (&mut self.item_state, len)
+            }
             (Section::SshKeys, _) => (&mut self.ssh_state, self.ssh_keys.len()),
             (Section::GpgKeys, _) => (&mut self.gpg_state, self.gpg_keys.len()),
         };
@@ -804,7 +944,7 @@ impl App {
         let changed = state.selected() != Some(target);
         state.select(Some(target));
         if changed && self.section == Section::Keyrings && self.pane == Pane::Keyrings {
-            self.load_selected_items();
+            self.select_other_keyring();
         }
     }
 
@@ -830,6 +970,16 @@ impl App {
     }
 
     // --- Passwords -------------------------------------------------------
+
+    /// The keyring cursor moved to a different keyring.
+    ///
+    /// A filter belongs to the list it was typed against, so it goes here —
+    /// but *not* in [`Self::load_selected_items`], which also runs on a plain
+    /// refresh, where keeping the filter is what the user expects.
+    fn select_other_keyring(&mut self) {
+        self.item_filter.clear();
+        self.load_selected_items();
+    }
 
     fn load_selected_items(&mut self) {
         self.items.clear();
@@ -1040,14 +1190,18 @@ impl App {
                     return;
                 }
                 self.items = items;
-                self.item_state
-                    .select((!self.items.is_empty()).then_some(0));
+                // A filter can survive a reload — after a delete, say — so
+                // the cursor goes on the first *visible* row.
+                let visible = self.visible_item_count();
+                self.item_state.select((visible > 0).then_some(0));
                 let locked = self.selected_keyring().is_some_and(|k| k.locked);
                 if self.section == Section::Keyrings {
                     self.status = if self.items.is_empty() && locked {
                         "keyring is locked — press u to unlock".into()
-                    } else {
+                    } else if self.item_filter.is_empty() {
                         format!("{} item(s)", self.items.len())
+                    } else {
+                        format!("{visible} of {} item(s) match", self.items.len())
                     };
                 }
             }
@@ -1510,6 +1664,283 @@ mod tests {
         });
         assert!(harness.secrets_requests().is_empty());
         assert_eq!(harness.ssh_requests(), vec![SshRequest::ListKeys]);
+    }
+
+    /// Four items whose labels and attributes overlap in different ways, so
+    /// that a filter can be shown to match on each.
+    fn filterable() -> Harness {
+        let mut harness = Harness::new();
+        harness
+            .app
+            .on_reply(Reply::Keyrings(vec![keyring(0, "Login", false)]));
+
+        let mut gitlab = item(2, "GitLab token");
+        gitlab
+            .attributes
+            .insert("service".into(), "gitlab.com".into());
+        let mut mail = item(3, "Mail");
+        mail.attributes
+            .insert("username".into(), "greg@example".into());
+
+        harness.app.on_reply(Reply::Items {
+            keyring: 0,
+            items: vec![item(0, "alpha"), item(1, "GitHub token"), gitlab, mail],
+        });
+        harness.drain();
+        harness
+    }
+
+    fn visible_labels(app: &App) -> Vec<String> {
+        app.visible_items()
+            .iter()
+            .map(|item| item.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_filter_narrows_the_item_list_by_label() {
+        let mut harness = filterable();
+        harness.press(KeyCode::Char('/'));
+        assert_eq!(harness.app.prompt, Some(Prompt::Ask(Question::ItemFilter)));
+
+        type_text(&mut harness, "git");
+        harness.press(KeyCode::Enter);
+
+        assert_eq!(
+            visible_labels(&harness.app),
+            vec!["GitHub token", "GitLab token"],
+            "the match is case-insensitive"
+        );
+        assert_eq!(
+            harness.app.items.len(),
+            4,
+            "filtering is a view; nothing is dropped"
+        );
+    }
+
+    #[test]
+    fn a_filter_matches_attributes_too() {
+        let mut harness = filterable();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "greg@");
+        harness.press(KeyCode::Enter);
+
+        assert_eq!(
+            visible_labels(&harness.app),
+            vec!["Mail"],
+            "an address stored as an attribute is findable"
+        );
+    }
+
+    #[test]
+    fn an_empty_filter_clears_rather_than_cancels() {
+        let mut harness = filterable();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "git");
+        harness.press(KeyCode::Enter);
+
+        // `/` re-opens pre-filled, so this is also how a filter is edited.
+        harness.press(KeyCode::Char('/'));
+        assert_eq!(harness.app.input.value(), "git");
+
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        harness.press(KeyCode::Enter);
+
+        assert!(harness.app.item_filter.is_empty());
+        assert_eq!(visible_labels(&harness.app).len(), 4);
+    }
+
+    #[test]
+    fn a_filter_keeps_the_cursor_on_a_row_that_exists() {
+        let mut harness = filterable();
+        harness.press(KeyCode::Char('l')); // focus the item list
+        harness.press(KeyCode::Char('G')); // last row, index 3
+
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "alpha");
+        harness.press(KeyCode::Enter);
+
+        assert_eq!(
+            harness.app.item_state.selected(),
+            Some(0),
+            "the cursor is clamped to the one remaining row"
+        );
+        assert_eq!(
+            harness.app.selected_item().map(|item| item.label.as_str()),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_leaves_no_selection() {
+        let mut harness = filterable();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "nothing here");
+        harness.press(KeyCode::Enter);
+
+        assert!(harness.app.visible_items().is_empty());
+        assert_eq!(harness.app.item_state.selected(), None);
+        assert!(
+            harness.app.selected_item().is_none(),
+            "nothing is selected, so nothing can be acted on"
+        );
+    }
+
+    #[test]
+    fn moving_to_another_keyring_clears_the_filter() {
+        let mut harness = Harness::loaded(); // two keyrings
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "alpha");
+        harness.press(KeyCode::Enter);
+        assert_eq!(harness.app.item_filter, "alpha");
+
+        harness.press(KeyCode::Char('j')); // the Session keyring
+        assert!(
+            harness.app.item_filter.is_empty(),
+            "a filter belongs to the list it was typed against"
+        );
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::ListItems { keyring: 1 }]
+        );
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_filter() {
+        let mut harness = filterable();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "git");
+        harness.press(KeyCode::Enter);
+
+        // What a delete triggers: the keyring is re-read, same keyring.
+        harness.app.on_reply(Reply::Items {
+            keyring: 0,
+            items: vec![item(0, "alpha"), item(1, "GitHub token")],
+        });
+
+        assert_eq!(harness.app.item_filter, "git");
+        assert_eq!(visible_labels(&harness.app), vec!["GitHub token"]);
+        assert_eq!(
+            harness.app.item_state.selected(),
+            Some(0),
+            "the cursor lands on the first visible row, not the first row"
+        );
+    }
+
+    #[test]
+    fn deleting_an_item_asks_first() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('x'));
+        assert_eq!(harness.app.prompt, Some(Prompt::ConfirmDeleteItem));
+        assert!(
+            harness.secrets_requests().is_empty(),
+            "nothing is sent until it is confirmed"
+        );
+
+        harness.press(KeyCode::Char('y'));
+        assert_eq!(harness.app.prompt, None);
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::DeleteItem {
+                keyring: 0,
+                item: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn cancelling_the_delete_sends_nothing() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('x'));
+        harness.press(KeyCode::Char('n'));
+        assert_eq!(harness.app.prompt, None);
+        assert!(harness.secrets_requests().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_filtered_row_deletes_that_row() {
+        // The reason the filter is a view: a row the user picked out of a
+        // narrowed list still carries the id the backend indexes by.
+        let mut harness = filterable();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "git");
+        harness.press(KeyCode::Enter);
+
+        harness.press(KeyCode::Char('l')); // focus the item list
+        harness.press(KeyCode::Char('j')); // second visible row: GitLab, id 2
+        assert_eq!(
+            harness.app.selected_item().map(|item| item.label.as_str()),
+            Some("GitLab token")
+        );
+
+        harness.press(KeyCode::Char('x'));
+        harness.press(KeyCode::Char('y'));
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::DeleteItem {
+                keyring: 0,
+                item: 2
+            }],
+            "not index 1, which is where the row sits in the filtered view"
+        );
+    }
+
+    #[test]
+    fn delete_does_nothing_without_a_selected_item() {
+        let mut harness = Harness::new();
+        harness
+            .app
+            .on_reply(Reply::Keyrings(vec![keyring(0, "Login", true)]));
+        harness.app.on_reply(Reply::Items {
+            keyring: 0,
+            items: Vec::new(),
+        });
+        harness.drain();
+
+        harness.press(KeyCode::Char('x'));
+        assert_eq!(
+            harness.app.prompt, None,
+            "an empty list has nothing to confirm deleting"
+        );
+        assert!(harness.secrets_requests().is_empty());
+    }
+
+    #[test]
+    fn delete_and_filter_only_act_in_the_keyrings_section() {
+        let mut harness = Harness::ssh_loaded();
+        // `x` is the agent key here, and `/` is unbound outside GPG.
+        harness.press(KeyCode::Char('x'));
+        assert_eq!(harness.app.prompt, None);
+        assert!(
+            harness.secrets_requests().is_empty(),
+            "x in the SSH section must not reach the secret service"
+        );
+        assert_eq!(
+            harness.ssh_requests(),
+            vec![SshRequest::RemoveFromAgent { key: 0 }]
+        );
+    }
+
+    #[test]
+    fn revealing_a_secret_is_dropped_when_the_filter_changes() {
+        let mut harness = filterable();
+        harness.app.on_reply(Reply::Secret {
+            keyring: 0,
+            item: 0,
+            value: Zeroizing::new("hunter2".into()),
+        });
+        assert!(harness.app.revealed.is_some());
+
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "git");
+        harness.press(KeyCode::Enter);
+
+        assert!(
+            harness.app.revealed.is_none(),
+            "the row it belonged to may no longer be on screen"
+        );
     }
 
     // --- SSH keys --------------------------------------------------------

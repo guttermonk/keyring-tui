@@ -159,7 +159,7 @@ preset = "terminal"
 #   anywhere    Quit Help Refresh NextSection PrevSection
 #               SectionPasswords SectionGpgKeys SectionSshKeys
 #               MoveDown MoveUp First Last FocusLeft FocusRight
-#   Passwords   Unlock Lock ToggleSecret
+#   Passwords   Unlock Lock ToggleSecret FilterItems DeleteItem
 #   SSH Keys    AgentAdd AgentRemove NewSshKey SshCopyId
 #   GPG Keys    GpgEdit GpgExport GpgPublish GpgDelete NewGpgKey
 #               ToggleGpgFilter GpgImport GpgSearch

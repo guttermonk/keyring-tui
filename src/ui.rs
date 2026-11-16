@@ -104,9 +104,9 @@ fn draw_keyrings(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
         );
     frame.render_stateful_widget(keyrings, left, &mut app.keyring_state);
 
-    // Items.
-    let rows: Vec<ListItem> = app
-        .items
+    // Items, as narrowed by the filter.
+    let visible = app.visible_items();
+    let rows: Vec<ListItem> = visible
         .iter()
         .map(|item| {
             let mut spans = vec![Span::raw(item.label.clone())];
@@ -118,10 +118,20 @@ fn draw_keyrings(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
         })
         .collect();
 
-    let title = match app.selected_keyring() {
+    let mut title = match app.selected_keyring() {
         Some(keyring) => format!("Items — {}", keyring.label),
         None => "Items".to_string(),
     };
+    // An active filter is the reason rows are missing, so say so in the one
+    // place someone looking at a short list will read.
+    if !app.item_filter.is_empty() {
+        title.push_str(&format!(
+            " — /{} ({} of {})",
+            app.item_filter,
+            visible.len(),
+            app.items.len()
+        ));
+    }
     let items = List::new(rows)
         .block(pane_block(&title, app.pane == Pane::List, p))
         .highlight_symbol("▌")
@@ -573,7 +583,11 @@ fn hint_line(app: &App) -> String {
     }
 
     let section_actions: &[(Action, &str)] = match app.section {
-        Section::Keyrings => &[(Action::Unlock, "unlock"), (Action::ToggleSecret, "secret")],
+        Section::Keyrings => &[
+            (Action::Unlock, "unlock"),
+            (Action::ToggleSecret, "secret"),
+            (Action::FilterItems, "filter"),
+        ],
         Section::SshKeys => &[
             (Action::AgentAdd, "add"),
             (Action::AgentRemove, "remove"),
@@ -689,6 +703,16 @@ fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt, p: &Pal
             " Publish key ".to_string(),
             format!("{subject}\n\n{PUBLISH_GPG_KEY_PROMPT}"),
         ),
+        Prompt::ConfirmDeleteItem => {
+            let item = app
+                .selected_item()
+                .map(|item| item.label.clone())
+                .unwrap_or_default();
+            (
+                " Delete secret ".to_string(),
+                format!("{item}\n\n{DELETE_ITEM_PROMPT}"),
+            )
+        }
     };
 
     // The prose is written out; the keys come from the prompt keymap, so a
@@ -704,6 +728,7 @@ fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt, p: &Pal
         ],
         Prompt::ConfirmGpgDelete => &[(Action::Confirm, "delete"), (Action::Cancel, "cancel")],
         Prompt::ConfirmGpgPublish => &[(Action::Confirm, "publish"), (Action::Cancel, "cancel")],
+        Prompt::ConfirmDeleteItem => &[(Action::Confirm, "delete"), (Action::Cancel, "cancel")],
     };
 
     let map = app.keymaps().get(Mode::Prompt);
@@ -848,6 +873,11 @@ Runs gpg --send-keys. Keyservers do not forget: a published
 key, and every user ID on it, stays public.
 ";
 
+const DELETE_ITEM_PROMPT: &str = "\
+Deletes this secret from the keyring. There is no trash and no
+undo, and whatever stored it will have to be told again.
+";
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -979,6 +1009,74 @@ mod tests {
         });
         let screen = render(&mut app);
         assert!(screen.contains("hunter2"), "{screen}");
+    }
+
+    #[test]
+    fn a_filtered_item_list_says_so_in_its_title() {
+        let mut app = app();
+        app.on_reply(Reply::Keyrings(vec![KeyringInfo {
+            id: 0,
+            label: "Login".into(),
+            locked: false,
+            is_default: true,
+        }]));
+        app.on_reply(Reply::Items {
+            keyring: 0,
+            items: vec![item("github token"), item("mail")],
+        });
+
+        // `/` then "git", the way the keymap drives it.
+        for code in [KeyCode::Char('/'), KeyCode::Char('g'), KeyCode::Char('i')] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let screen = render(&mut app);
+        assert!(
+            screen.contains("/git"),
+            "the title has to explain the short list:\n{screen}"
+        );
+        assert!(screen.contains("1 of 2"), "{screen}");
+        assert!(
+            !screen.contains("mail"),
+            "the filtered row is gone:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_delete_confirmation_names_the_secret() {
+        let mut app = app();
+        app.on_reply(Reply::Keyrings(vec![KeyringInfo {
+            id: 0,
+            label: "Login".into(),
+            locked: false,
+            is_default: true,
+        }]));
+        app.on_reply(Reply::Items {
+            keyring: 0,
+            items: vec![item("github token")],
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        let screen = render(&mut app);
+        assert!(screen.contains("Delete secret"), "{screen}");
+        assert!(
+            screen.contains("github token"),
+            "the modal must name what goes:\n{screen}"
+        );
+        assert!(screen.contains("no trash"), "{screen}");
+    }
+
+    fn item(label: &str) -> ItemInfo {
+        ItemInfo {
+            id: 0,
+            label: label.into(),
+            attributes: Default::default(),
+            locked: false,
+            created: None,
+            modified: None,
+        }
     }
 
     #[test]
