@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # This repository merges topic branches rather than opening PRs, so the two
+  # triggers above only fire once the work has already landed. Dispatch is how
+  # a branch gets checked before that.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # The Nix build is what `nix run` and the NixOS config install, and
+  # buildRustPackage's checkPhase runs the whole test suite inside the
+  # sandbox — so this job covers building and testing against the exact
+  # dependency set the flake pins.
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Flake check
+        run: nix flake check --print-build-logs
+      - name: Build
+        run: nix build --print-build-logs
+
+  # Neither of these is covered by the flake check: it has no `checks`
+  # outputs, so clippy is only a devShell package here, and the flake's
+  # formatter is nixfmt, which has nothing to say about Rust.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # gpgme is a C binding; clippy has to link it like any other build.
+      - name: Install gpgme
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libgpgme-dev libgpg-error-dev libassuan-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Linting
+        run: cargo clippy --all-targets -- --deny warnings
+
+  # A plain cargo build with none of the flake's arrangements, because that is
+  # what anyone cloning the repo runs first.
+  #
+  # This job is the point of the whole file. keyring-tui links gpgme,
+  # libgpg-error and libassuan, and every build this project has ever had ran
+  # inside `nix develop`, where flake.nix supplies all three plus pkg-config.
+  # Nothing has ever proved it builds on a machine that only has the distro's
+  # packages — which is exactly the gap that let the sibling repo ship a
+  # Cargo.toml needing libdbus while only the Nix job was green.
+  #
+  # Linux only, deliberately: the Secret Service backend talks to D-Bus and
+  # the agent client talks to $SSH_AUTH_SOCK, so a macOS job would be testing
+  # a platform the app does not claim to support.
+  cargo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install gpgme
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libgpgme-dev libgpg-error-dev libassuan-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # --locked so a stale Cargo.lock fails here rather than resolving to
+      # something nobody tested. The three #[ignore]d tests need a live
+      # keyring, ssh-agent and ~/.gnupg, and stay skipped on a runner.
+      - name: Test
+        run: cargo test --locked --all-targets
