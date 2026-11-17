@@ -587,6 +587,7 @@ fn hint_line(app: &App) -> String {
             (Action::Unlock, "unlock"),
             (Action::ToggleSecret, "secret"),
             (Action::FilterItems, "filter"),
+            (Action::NewKeyring, "new"),
         ],
         Section::SshKeys => &[
             (Action::AgentAdd, "add"),
@@ -714,6 +715,27 @@ fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt, p: &Pal
                 format!("{item}\n\n{DELETE_ITEM_PROMPT}"),
             )
         }
+        Prompt::ConfirmDeleteKeyring => {
+            let mut body = String::new();
+            if let Some(keyring) = app.selected_keyring() {
+                body.push_str(&keyring.label);
+                if keyring.is_default {
+                    body.push_str("  (the default keyring)");
+                }
+                body.push('\n');
+                // A locked keyring reports no items, so counting them would
+                // read as "this one is empty" when it is only shut.
+                body.push_str(&if keyring.locked {
+                    "locked — what is in it cannot be counted from here\n".to_string()
+                } else {
+                    format!("{} item(s)\n", app.items.len())
+                });
+            }
+            (
+                " Delete keyring ".to_string(),
+                format!("{body}\n{DELETE_KEYRING_PROMPT}"),
+            )
+        }
         Prompt::ConfirmSshDelete => {
             // The files are the whole point of the question, so they are
             // listed rather than summarised.
@@ -746,7 +768,7 @@ fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt, p: &Pal
         ],
         Prompt::ConfirmGpgDelete => &[(Action::Confirm, "delete"), (Action::Cancel, "cancel")],
         Prompt::ConfirmGpgPublish => &[(Action::Confirm, "publish"), (Action::Cancel, "cancel")],
-        Prompt::ConfirmDeleteItem | Prompt::ConfirmSshDelete => {
+        Prompt::ConfirmDeleteItem | Prompt::ConfirmSshDelete | Prompt::ConfirmDeleteKeyring => {
             &[(Action::Confirm, "delete"), (Action::Cancel, "cancel")]
         }
     };
@@ -896,6 +918,12 @@ key, and every user ID on it, stays public.
 const DELETE_ITEM_PROMPT: &str = "\
 Deletes this secret from the keyring. There is no trash and no
 undo, and whatever stored it will have to be told again.
+";
+
+const DELETE_KEYRING_PROMPT: &str = "\
+Deletes the keyring and every secret in it. There is no trash
+and no undo. Unlocking it first is not required and would not
+help: the service removes the store either way.
 ";
 
 const DELETE_SSH_KEY_PROMPT: &str = "\
@@ -1092,6 +1120,52 @@ mod tests {
             "the modal must name what goes:\n{screen}"
         );
         assert!(screen.contains("no trash"), "{screen}");
+    }
+
+    #[test]
+    fn the_keyring_delete_confirmation_counts_what_goes() {
+        let mut app = app();
+        app.on_reply(Reply::Keyrings(vec![KeyringInfo {
+            id: 0,
+            label: "Login".into(),
+            locked: false,
+            is_default: true,
+        }]));
+        app.on_reply(Reply::Items {
+            keyring: 0,
+            items: vec![item("github token"), item("mail")],
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+
+        let screen = render(&mut app);
+        assert!(screen.contains("Delete keyring"), "{screen}");
+        assert!(
+            screen.contains("the default keyring"),
+            "deleting the default is worth saying out loud:\n{screen}"
+        );
+        assert!(screen.contains("2 item(s)"), "{screen}");
+    }
+
+    #[test]
+    fn a_locked_keyring_is_not_reported_as_empty() {
+        let mut app = app();
+        app.on_reply(Reply::Keyrings(vec![KeyringInfo {
+            id: 0,
+            label: "Archive".into(),
+            locked: true,
+            is_default: false,
+        }]));
+        // A locked collection answers with no items, which must not be
+        // rendered as "this one is empty".
+        app.on_reply(Reply::Items {
+            keyring: 0,
+            items: Vec::new(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+
+        let screen = render(&mut app);
+        assert!(screen.contains("cannot be counted"), "{screen}");
+        assert!(!screen.contains("0 item(s)"), "{screen}");
     }
 
     #[test]

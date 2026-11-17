@@ -52,6 +52,9 @@ fn main() -> Keymap {
         // all three sections. Section-aware resolution keeps them apart.
         bind(Action::FilterItems, "/"),
         bind(Action::DeleteItem, "x"),
+        // `n` is "new" in every section; `D` is the bigger delete, as in SSH.
+        bind(Action::NewKeyring, "n"),
+        bind(Action::DeleteKeyring, "D"),
         // SSH keys.
         bind(Action::AgentAdd, "a"),
         bind(Action::AgentRemove, "x"),

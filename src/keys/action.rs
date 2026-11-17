@@ -74,6 +74,8 @@ pub enum Action {
     ToggleSecret,
     FilterItems,
     DeleteItem,
+    NewKeyring,
+    DeleteKeyring,
 
     // SSH keys.
     AgentAdd,
@@ -135,6 +137,8 @@ impl Action {
             Self::ToggleSecret => "reveal / hide the secret",
             Self::FilterItems => "filter the item list",
             Self::DeleteItem => "delete the stored secret",
+            Self::NewKeyring => "new keyring",
+            Self::DeleteKeyring => "delete the keyring and everything in it",
             Self::AgentAdd => "add to the ssh-agent (runs ssh-add)",
             Self::AgentRemove => "remove from the ssh-agent",
             Self::NewSshKey => "new SSH key (runs ssh-keygen)",
@@ -172,7 +176,9 @@ impl Action {
             | Self::Lock
             | Self::ToggleSecret
             | Self::FilterItems
-            | Self::DeleteItem => Some(Section::Keyrings),
+            | Self::DeleteItem
+            | Self::NewKeyring
+            | Self::DeleteKeyring => Some(Section::Keyrings),
             Self::AgentAdd
             | Self::AgentRemove
             | Self::NewSshKey

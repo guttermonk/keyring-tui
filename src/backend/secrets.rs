@@ -76,7 +76,48 @@ impl State {
             SecretsRequest::Lock { keyring } => self.set_locked(keyring, true).await,
             SecretsRequest::RevealSecret { keyring, item } => self.reveal(keyring, item).await,
             SecretsRequest::DeleteItem { keyring, item } => self.delete_item(keyring, item).await,
+            SecretsRequest::CreateKeyring { label } => self.create_keyring(label).await,
+            SecretsRequest::DeleteKeyring { keyring } => self.delete_keyring(keyring).await,
         }
+    }
+
+    /// Create an empty collection.
+    ///
+    /// The passphrase is the service's business: `CreateCollection` returns a
+    /// prompt, which the agent shows (pinentry, normally) and `oo7` drives to
+    /// completion. Nothing is typed into this process.
+    async fn create_keyring(&mut self, label: String) -> Result<Reply, String> {
+        // `None` alias. The alias is how `default` gets assigned, and quietly
+        // moving someone's default collection is not what "new keyring"
+        // means — the service hands out an unaliased one.
+        self.service
+            .create_collection(&label, None, None)
+            .await
+            .map_err(|err| format!("creating {label} failed: {err}"))?;
+
+        Ok(Reply::Status {
+            message: format!("created {label}"),
+            refresh: Refresh::Keyrings,
+        })
+    }
+
+    /// Delete a collection and every item in it.
+    async fn delete_keyring(&mut self, keyring: usize) -> Result<Reply, String> {
+        let collection = self
+            .collections
+            .get(keyring)
+            .ok_or_else(|| stale("keyring"))?;
+        let label = label_or_path(collection).await;
+
+        collection
+            .delete(None)
+            .await
+            .map_err(|err| format!("deleting {label} failed: {err}"))?;
+
+        Ok(Reply::Status {
+            message: format!("deleted {label}"),
+            refresh: Refresh::Keyrings,
+        })
     }
 
     async fn list_keyrings(&mut self) -> Result<Reply, String> {

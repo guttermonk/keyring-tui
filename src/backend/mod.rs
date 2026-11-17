@@ -46,6 +46,15 @@ pub enum SecretsRequest {
         keyring: usize,
         item: usize,
     },
+    /// Create an empty keyring. The service prompts for its passphrase
+    /// through its own agent, so no secret passes through here.
+    CreateKeyring {
+        label: String,
+    },
+    /// Delete a keyring and everything in it. Confirmed in the UI.
+    DeleteKeyring {
+        keyring: usize,
+    },
 }
 
 /// Commands for the GPG backend.

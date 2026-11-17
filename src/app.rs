@@ -62,6 +62,8 @@ pub enum Prompt {
     /// Confirm unlinking the selected SSH key's files. A private key is the
     /// one thing here that no amount of re-running can get back.
     ConfirmSshDelete,
+    /// Confirm deleting a keyring, which takes every secret in it.
+    ConfirmDeleteKeyring,
     /// A one-line text field. The text itself lives in [`App::input`] so that
     /// this enum stays `Copy`.
     Ask(Question),
@@ -82,6 +84,9 @@ pub enum Question {
     SshCopyTarget,
     /// A substring to narrow the item list by.
     ItemFilter,
+    /// A name for a new keyring. The service asks for its passphrase itself,
+    /// so this field only ever holds the label.
+    NewKeyringLabel,
 }
 
 impl Question {
@@ -92,6 +97,7 @@ impl Question {
             Self::GpgSearch => " Search a keyserver ",
             Self::SshCopyTarget => " Copy this key to a host ",
             Self::ItemFilter => " Filter items ",
+            Self::NewKeyringLabel => " New keyring ",
         }
     }
 
@@ -110,6 +116,10 @@ impl Question {
                 "Narrows the list to items whose label or attributes contain\n\
                  this text. Empty shows everything again."
             }
+            Self::NewKeyringLabel => {
+                "Creates an empty keyring. The service asks for its\n\
+                 passphrase itself, through its own prompt."
+            }
         }
     }
 
@@ -120,6 +130,7 @@ impl Question {
             Self::GpgSearch => "search",
             Self::SshCopyTarget => "[user@]host",
             Self::ItemFilter => "match",
+            Self::NewKeyringLabel => "name",
         }
     }
 }
@@ -589,6 +600,12 @@ impl App {
                 }
             }
             Action::DeleteItem => self.confirm(Prompt::ConfirmDeleteItem),
+            Action::NewKeyring => {
+                if self.section == Section::Keyrings {
+                    self.ask(Question::NewKeyringLabel, "");
+                }
+            }
+            Action::DeleteKeyring => self.confirm(Prompt::ConfirmDeleteKeyring),
 
             Action::AgentAdd => self.add_to_agent(),
             Action::SshCopyId => self.copy_key_to_host(),
@@ -694,6 +711,14 @@ impl App {
                 Action::Cancel => self.cancel_prompt(),
                 _ => {}
             },
+            Prompt::ConfirmDeleteKeyring => match action {
+                Action::Confirm => {
+                    self.prompt = None;
+                    self.delete_keyring();
+                }
+                Action::Cancel => self.cancel_prompt(),
+                _ => {}
+            },
         }
     }
 
@@ -765,6 +790,10 @@ impl App {
                     target: answer,
                 });
             }
+            Question::NewKeyringLabel => {
+                self.status = format!("creating {answer}…");
+                self.send(SecretsRequest::CreateKeyring { label: answer });
+            }
             // Handled above, before the empty-answer check.
             Question::ItemFilter => {}
         }
@@ -795,6 +824,20 @@ impl App {
                 self.item_filter
             )
         };
+    }
+
+    /// Ask the backend to delete the keyring under the cursor.
+    ///
+    /// Everything in it goes too, which is what the confirmation is for. The
+    /// cursor is left to the refresh: `Reply::Keyrings` cannot find the old
+    /// label any more and falls back to the first row.
+    fn delete_keyring(&mut self) {
+        let Some(keyring) = self.selected_keyring().map(|keyring| keyring.id) else {
+            return;
+        };
+        self.hide_secret();
+        self.send(SecretsRequest::DeleteKeyring { keyring });
+        self.status = "deleting…".into();
     }
 
     /// Ask the backend to delete the item under the cursor.
@@ -835,6 +878,9 @@ impl App {
             }
             Prompt::ConfirmDeleteItem => {
                 self.section == Section::Keyrings && self.selected_item().is_some()
+            }
+            Prompt::ConfirmDeleteKeyring => {
+                self.section == Section::Keyrings && self.selected_keyring().is_some()
             }
             Prompt::ConfirmSshDelete if self.section != Section::SshKeys => false,
             Prompt::ConfirmSshDelete => {
@@ -1259,9 +1305,16 @@ impl App {
                 let previous = self.selected_keyring().map(|k| k.label.clone());
                 self.keyrings = keyrings;
                 let restored = previous
+                    .as_deref()
                     .and_then(|label| self.keyrings.iter().position(|k| k.label == label))
                     .or_else(|| (!self.keyrings.is_empty()).then_some(0));
                 self.keyring_state.select(restored);
+                // Landing on a different keyring than before — because this
+                // one was just deleted, or renamed elsewhere — means a new
+                // list, so a filter typed against the old one goes with it.
+                if self.selected_keyring().map(|k| k.label.clone()) != previous {
+                    self.item_filter.clear();
+                }
                 if self.section == Section::Keyrings {
                     self.status = format!("{} keyring(s)", self.keyrings.len());
                 }
@@ -2004,6 +2057,137 @@ mod tests {
         assert_eq!(
             harness.ssh_requests(),
             vec![SshRequest::RemoveFromAgent { key: 0 }]
+        );
+    }
+
+    #[test]
+    fn n_asks_for_a_name_and_creates_a_keyring() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('n'));
+        assert_eq!(
+            harness.app.prompt,
+            Some(Prompt::Ask(Question::NewKeyringLabel))
+        );
+
+        type_text(&mut harness, "Work");
+        harness.press(KeyCode::Enter);
+
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::CreateKeyring {
+                label: "Work".into()
+            }],
+            "the passphrase is the service's to ask for; we only send a name"
+        );
+    }
+
+    #[test]
+    fn creating_a_keyring_with_no_name_does_nothing() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('n'));
+        harness.press(KeyCode::Enter);
+        assert_eq!(harness.app.prompt, None);
+        assert!(harness.secrets_requests().is_empty());
+    }
+
+    #[test]
+    fn n_creates_a_keyring_in_passwords_but_a_key_elsewhere() {
+        // `n` is "new" in all three sections; the section picks which new.
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('n'));
+        assert_eq!(
+            harness.app.prompt,
+            Some(Prompt::Ask(Question::NewKeyringLabel))
+        );
+
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('n'));
+        assert_eq!(harness.app.prompt, Some(Prompt::NewSshKey));
+
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('n'));
+        assert!(harness.app.take_external().is_some(), "gpg asks everything");
+    }
+
+    #[test]
+    fn deleting_a_keyring_asks_first() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('D'));
+        assert_eq!(harness.app.prompt, Some(Prompt::ConfirmDeleteKeyring));
+        assert!(harness.secrets_requests().is_empty());
+
+        harness.press(KeyCode::Char('y'));
+        assert_eq!(harness.app.prompt, None);
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::DeleteKeyring { keyring: 0 }]
+        );
+    }
+
+    #[test]
+    fn cancelling_the_keyring_delete_sends_nothing() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('D'));
+        harness.press(KeyCode::Char('n'));
+        assert_eq!(harness.app.prompt, None);
+        assert!(harness.secrets_requests().is_empty());
+    }
+
+    #[test]
+    fn x_deletes_an_item_but_d_deletes_the_whole_keyring() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('x'));
+        harness.press(KeyCode::Char('y'));
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::DeleteItem {
+                keyring: 0,
+                item: 0
+            }]
+        );
+
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('D'));
+        harness.press(KeyCode::Char('y'));
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::DeleteKeyring { keyring: 0 }]
+        );
+    }
+
+    #[test]
+    fn d_acts_on_the_keyring_even_from_the_item_pane() {
+        // `u` and `L` already work on the selected keyring from any pane, and
+        // this follows them rather than inventing a pane rule.
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('l'));
+        assert_eq!(harness.app.pane, Pane::List);
+
+        harness.press(KeyCode::Char('D'));
+        assert_eq!(harness.app.prompt, Some(Prompt::ConfirmDeleteKeyring));
+    }
+
+    #[test]
+    fn losing_the_selected_keyring_clears_the_filter() {
+        let mut harness = filterable();
+        harness.press(KeyCode::Char('/'));
+        type_text(&mut harness, "git");
+        harness.press(KeyCode::Enter);
+        harness.drain();
+
+        // What a delete looks like coming back: the keyring the cursor was on
+        // is simply not in the new listing.
+        harness
+            .app
+            .on_reply(Reply::Keyrings(vec![keyring(0, "Session", false)]));
+
+        assert!(
+            harness.app.item_filter.is_empty(),
+            "the cursor landed on a different keyring, so the filter is stale"
+        );
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::ListItems { keyring: 0 }]
         );
     }
 

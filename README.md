@@ -50,6 +50,8 @@ In **Passwords**:
 | `s` | reveal / hide the selected secret |
 | `/` | filter the item list by label or attribute — empty clears it |
 | `x` | delete the selected secret — asks first |
+| `n` | new keyring — asks for a name |
+| `D` | delete the keyring and everything in it — asks first |
 
 In **SSH Keys**:
 
@@ -247,8 +249,8 @@ reimplementing gpg's prompts would be both more code and less safe.
   error — drops the revealed secret immediately.
 * A reply that arrives after the cursor has moved off its row is discarded
   rather than displayed against the wrong item.
-* Passphrases for locking and unlocking are never read by this process; the
-  service prompts through its own agent.
+* Passphrases for locking, unlocking and creating a keyring are never read by
+  this process; the service prompts through its own agent.
 
 ## Roadmap
 
@@ -260,8 +262,8 @@ reimplementing gpg's prompts would be both more code and less safe.
 - [x] lock and unlock a keyring
 - [x] delete an item, behind a confirmation
 - [x] filter the item list by label or attribute
+- [x] create a keyring, and delete one behind a confirmation
 - [ ] create and edit items
-- [ ] create and delete keyrings
 - [ ] copy a secret to the clipboard with a timed clear
 
 Changing a keyring's passphrase is not on this list: the Secret Service
