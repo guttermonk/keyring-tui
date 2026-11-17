@@ -55,9 +55,13 @@ preset = "terminal"
 #   dim                 field labels, schemas, timestamps, hints
 #   border              an unfocused pane's border
 #   border_focused      the focused pane's border
-#   cursor_fg/bg        the selected row, and the selected tab
+#   cursor_fg/bg        the selected row in a list. Always set these as a
+#                       pair: one is drawn on the other.
 #   status_fg/bg        the status bar
-#   accent              headings, [sk] and [card] markers
+#   accent              headings, [sk] and [card] markers, and the selected
+#                       tab -- which is drawn in reverse video, so its text
+#                       takes the terminal's background colour and stays
+#                       readable whatever you set `accent` to
 #   ok                  [agent], "in agent: yes"
 #   warn                [locked], [expired], [revoked], a modal's border
 #   danger              errors

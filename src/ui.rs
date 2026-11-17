@@ -59,14 +59,26 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
         let index = section.index() + 1;
         Line::from(format!(" {index} {} ", section.title()))
     });
+    // Reverse video rather than a hand-picked pair of colours.
+    //
+    // The selected tab wants an accent-coloured block with the text in the
+    // *background* colour. Spelling that out as `fg(cursor_fg).bg(accent)`
+    // only worked because every preset happens to set `cursor_fg` to its own
+    // `bg` — and it broke outright for a palette that sets `accent` and
+    // `cursor_fg` to the same colour, which is what "make everything blue"
+    // naturally produces: blue text on a blue block.
+    //
+    // REVERSED asks the terminal to swap the cell's own foreground and
+    // background at display time, so the text is always drawn in whatever
+    // the real background is. That is legible by construction, on any
+    // palette and on a light terminal as readily as a dark one.
     let tabs = Tabs::new(titles)
         .select(app.section.index())
         .divider("")
         .highlight_style(
             Style::default()
-                .fg(p.cursor_fg)
-                .bg(p.accent)
-                .add_modifier(Modifier::BOLD),
+                .fg(p.accent)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         );
     frame.render_widget(tabs, area);
 }
@@ -1038,6 +1050,83 @@ mod tests {
     use crate::model::{
         AgentStatus, GpgFilter, GpgKeyInfo, GpgSubkey, GpgUid, ItemInfo, KeyringInfo, SshKeyInfo,
     };
+
+    /// The style of the first cell of the selected tab, under `palette`.
+    fn selected_tab_style(palette: &Palette) -> Style {
+        let mut app = app();
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, palette))
+            .unwrap();
+        // Column 1: inside the leading space of the first tab, which is the
+        // selected one at startup.
+        terminal.backend().buffer()[(1, 0)].style()
+    }
+
+    #[test]
+    fn the_selected_tab_stays_legible_when_accent_matches_the_cursor_colour() {
+        use crate::config::theme::{ColorSpec, Theme};
+        use ratatui::style::Color;
+
+        // Built the way a config builds it, because that is where this came
+        // from: "make everything blue" puts the same colour in `accent` and
+        // `cursor_fg`, and the tab used to paint one on the other.
+        let hostile = Theme {
+            preset: Default::default(),
+            colors: [
+                ("accent".to_string(), ColorSpec(Color::Blue)),
+                ("cursor_fg".to_string(), ColorSpec(Color::Blue)),
+                ("cursor_bg".to_string(), ColorSpec(Color::Reset)),
+            ]
+            .into_iter()
+            .collect(),
+        }
+        .palette()
+        .unwrap();
+
+        let style = selected_tab_style(&hostile);
+        assert!(
+            style.add_modifier.contains(Modifier::REVERSED),
+            "the terminal has to do the swap for the text to be readable: {style:?}"
+        );
+        assert_eq!(
+            style.fg,
+            Some(Color::Blue),
+            "and the block keeps the accent colour"
+        );
+        assert_ne!(
+            style.fg, style.bg,
+            "the one thing that must never happen again"
+        );
+    }
+
+    #[test]
+    fn every_preset_still_marks_the_selected_tab() {
+        use crate::config::theme::{Preset, Theme};
+
+        for preset in [
+            Preset::Terminal,
+            Preset::CatppuccinMocha,
+            Preset::GruvboxDark,
+            Preset::Nord,
+        ] {
+            let palette = Theme {
+                preset,
+                colors: Default::default(),
+            }
+            .palette()
+            .unwrap();
+            let style = selected_tab_style(&palette);
+            assert!(
+                style.add_modifier.contains(Modifier::REVERSED),
+                "{preset:?} should invert the selected tab"
+            );
+            assert!(
+                style.add_modifier.contains(Modifier::BOLD),
+                "{preset:?} should still embolden it"
+            );
+        }
+    }
 
     /// The rendered screen as one string per row, joined — enough to assert
     /// that a label is present without pinning the exact layout.
