@@ -76,9 +76,71 @@ impl State {
             SecretsRequest::Lock { keyring } => self.set_locked(keyring, true).await,
             SecretsRequest::RevealSecret { keyring, item } => self.reveal(keyring, item).await,
             SecretsRequest::DeleteItem { keyring, item } => self.delete_item(keyring, item).await,
+            SecretsRequest::SetItemLabel {
+                keyring,
+                item,
+                label,
+            } => self.set_item_label(keyring, item, label).await,
+            SecretsRequest::SetItemAttributes {
+                keyring,
+                item,
+                attributes,
+            } => self.set_item_attributes(keyring, item, attributes).await,
             SecretsRequest::CreateKeyring { label } => self.create_keyring(label).await,
             SecretsRequest::DeleteKeyring { keyring } => self.delete_keyring(keyring).await,
         }
+    }
+
+    /// The handle for one item, or the message that says the list is stale.
+    fn item(&self, keyring: usize, item: usize) -> Result<&Item, String> {
+        self.items
+            .get(keyring)
+            .and_then(|items| items.get(item))
+            .ok_or_else(|| stale("item"))
+    }
+
+    async fn set_item_label(
+        &mut self,
+        keyring: usize,
+        item: usize,
+        label: String,
+    ) -> Result<Reply, String> {
+        self.item(keyring, item)?
+            .set_label(&label)
+            .await
+            .map_err(|err| format!("renaming failed: {err}"))?;
+
+        Ok(Reply::Status {
+            message: format!("renamed to {label}"),
+            refresh: Refresh::Keyrings,
+        })
+    }
+
+    /// Replace an item's attributes.
+    ///
+    /// Wholesale, because `SetAttributes` is all the spec offers — there is
+    /// no per-attribute edit. The UI therefore pre-fills its field with the
+    /// current set, so changing one attribute does not drop the rest.
+    async fn set_item_attributes(
+        &mut self,
+        keyring: usize,
+        item: usize,
+        attributes: Vec<(String, String)>,
+    ) -> Result<Reply, String> {
+        let map: BTreeMap<&str, &str> = attributes
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+
+        self.item(keyring, item)?
+            .set_attributes(&map)
+            .await
+            .map_err(|err| format!("setting attributes failed: {err}"))?;
+
+        Ok(Reply::Status {
+            message: format!("set {} attribute(s)", attributes.len()),
+            refresh: Refresh::Keyrings,
+        })
     }
 
     /// Create an empty collection.
@@ -145,6 +207,7 @@ impl State {
                 is_default: default_path
                     .as_deref()
                     .is_some_and(|path| path == collection.path().as_str()),
+                path: collection.path().to_string(),
             });
         }
         Ok(Reply::Keyrings(keyrings))
@@ -237,11 +300,7 @@ impl State {
     /// what went — read before the delete, since afterwards there is nothing
     /// left to ask.
     async fn delete_item(&mut self, keyring: usize, item: usize) -> Result<Reply, String> {
-        let handle = self
-            .items
-            .get(keyring)
-            .and_then(|items| items.get(item))
-            .ok_or_else(|| stale("item"))?;
+        let handle = self.item(keyring, item)?;
 
         let label = handle.label().await.unwrap_or_else(|_| "the item".into());
         handle
@@ -258,11 +317,7 @@ impl State {
     }
 
     async fn reveal(&mut self, keyring: usize, item: usize) -> Result<Reply, String> {
-        let handle = self
-            .items
-            .get(keyring)
-            .and_then(|items| items.get(item))
-            .ok_or_else(|| stale("item"))?;
+        let handle = self.item(keyring, item)?;
 
         let secret = handle
             .secret()

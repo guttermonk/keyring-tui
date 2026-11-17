@@ -21,8 +21,9 @@ Without Nix you need a Rust toolchain, `pkg-config`, and `libgpgme` with its
 `libgpg-error` and `libassuan` dependencies — `gpgme` is a C binding, so
 `cargo build` outside the dev shell will not find it on its own. At runtime it
 wants `gpg`, `ssh-add`/`ssh-keygen`, and a Secret Service on the session bus.
-Copying to the clipboard additionally wants `wl-clipboard`, `xclip` or `xsel`
-— see [The clipboard](#the-clipboard) for why it is an external tool. All of
+Storing a new secret wants `secret-tool` (from libsecret), and copying to the
+clipboard wants `wl-clipboard`, `xclip` or `xsel` — see
+[The clipboard](#the-clipboard) for why that one is an external tool. All of
 these are looked up on `PATH` when used, so a missing one costs you that one
 operation and nothing else.
 
@@ -57,6 +58,8 @@ In **Passwords**:
 | `n` | new keyring — asks for a name |
 | `D` | delete the keyring and everything in it — asks first |
 | `y` | copy the secret to the clipboard, wiped after 45s |
+| `a` | store a new secret — asks for a name, then attributes (`secret-tool`) |
+| `R` / `A` | rename the item / edit its attributes |
 
 In **SSH Keys**:
 
@@ -303,7 +306,22 @@ And `SIGKILL` leaves no opportunity to wipe anything.
 - [x] filter the item list by label or attribute
 - [x] create a keyring, and delete one behind a confirmation
 - [x] copy a secret to the clipboard with a timed clear
-- [ ] create and edit items
+- [x] create an item, rename one, and edit its attributes
+
+Creating an item is the one Passwords operation that runs externally.
+Everything else here needs no secret, but a new item is a secret by
+definition — so `a` collects the name and attributes and hands over to
+`secret-tool store`, which asks for the password itself. There is no
+third field, and no password ever reaches this process. Renaming and
+editing attributes need no secret and go straight through D-Bus.
+
+Attributes are a single `key=value key=value` line, the form
+`secret-tool` itself takes them in. The Secret Service identifies an
+item *by* its attributes, so at least one is required, and `SetAttributes`
+replaces the whole set — which is why the edit field is pre-filled with
+all of them rather than starting empty. The limitation worth knowing:
+there is no quoting, so an attribute value cannot contain a space. Labels
+can.
 
 Changing a keyring's passphrase is not on this list: the Secret Service
 spec has no method for it. Seahorse does it through gnome-keyring's own

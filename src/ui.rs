@@ -676,6 +676,7 @@ fn hint_line(app: &App) -> String {
             (Action::FilterItems, "filter"),
             (Action::NewKeyring, "new"),
             (Action::CopySecret, "copy"),
+            (Action::NewItem, "add"),
         ],
         Section::SshKeys => &[
             (Action::AgentAdd, "add"),
@@ -1126,12 +1127,7 @@ mod tests {
     #[test]
     fn a_secret_is_masked_until_revealed() {
         let mut app = app();
-        app.on_reply(Reply::Keyrings(vec![KeyringInfo {
-            id: 0,
-            label: "Login".into(),
-            locked: false,
-            is_default: true,
-        }]));
+        app.on_reply(Reply::Keyrings(vec![keyring("Login", false)]));
         app.on_reply(Reply::Items {
             keyring: 0,
             items: vec![ItemInfo {
@@ -1160,12 +1156,7 @@ mod tests {
     #[test]
     fn a_filtered_item_list_says_so_in_its_title() {
         let mut app = app();
-        app.on_reply(Reply::Keyrings(vec![KeyringInfo {
-            id: 0,
-            label: "Login".into(),
-            locked: false,
-            is_default: true,
-        }]));
+        app.on_reply(Reply::Keyrings(vec![keyring("Login", false)]));
         app.on_reply(Reply::Items {
             keyring: 0,
             items: vec![item("github token"), item("mail")],
@@ -1193,12 +1184,7 @@ mod tests {
     #[test]
     fn a_delete_confirmation_names_the_secret() {
         let mut app = app();
-        app.on_reply(Reply::Keyrings(vec![KeyringInfo {
-            id: 0,
-            label: "Login".into(),
-            locked: false,
-            is_default: true,
-        }]));
+        app.on_reply(Reply::Keyrings(vec![keyring("Login", false)]));
         app.on_reply(Reply::Items {
             keyring: 0,
             items: vec![item("github token")],
@@ -1217,12 +1203,7 @@ mod tests {
     #[test]
     fn the_keyring_delete_confirmation_counts_what_goes() {
         let mut app = app();
-        app.on_reply(Reply::Keyrings(vec![KeyringInfo {
-            id: 0,
-            label: "Login".into(),
-            locked: false,
-            is_default: true,
-        }]));
+        app.on_reply(Reply::Keyrings(vec![keyring("Login", false)]));
         app.on_reply(Reply::Items {
             keyring: 0,
             items: vec![item("github token"), item("mail")],
@@ -1241,12 +1222,7 @@ mod tests {
     #[test]
     fn a_locked_keyring_is_not_reported_as_empty() {
         let mut app = app();
-        app.on_reply(Reply::Keyrings(vec![KeyringInfo {
-            id: 0,
-            label: "Archive".into(),
-            locked: true,
-            is_default: false,
-        }]));
+        app.on_reply(Reply::Keyrings(vec![keyring("Archive", true)]));
         // A locked collection answers with no items, which must not be
         // rendered as "this one is empty".
         app.on_reply(Reply::Items {
@@ -1294,6 +1270,16 @@ mod tests {
             "and the agent copy mentioned:\n{screen}"
         );
         assert!(screen.contains("cannot be regenerated"), "{screen}");
+    }
+
+    fn keyring(label: &str, locked: bool) -> KeyringInfo {
+        KeyringInfo {
+            id: 0,
+            label: label.into(),
+            locked,
+            is_default: !locked,
+            path: "/org/freedesktop/secrets/collection/c0".into(),
+        }
     }
 
     fn item(label: &str) -> ItemInfo {

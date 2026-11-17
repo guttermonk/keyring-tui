@@ -88,6 +88,18 @@ pub enum Question {
     /// A name for a new keyring. The service asks for its passphrase itself,
     /// so this field only ever holds the label.
     NewKeyringLabel,
+    /// A label for a new item — the first of two fields, the second being
+    /// [`Self::NewItemAttributes`]. The password is asked for by
+    /// `secret-tool`, not here.
+    NewItemLabel,
+    /// `key=value` attributes for the new item, which the Secret Service
+    /// uses as its identity. At least one is required.
+    NewItemAttributes,
+    /// A new label for the selected item.
+    ItemLabel,
+    /// Replacement attributes for the selected item, pre-filled with what it
+    /// has — `SetAttributes` replaces the whole set.
+    ItemAttributes,
 }
 
 impl Question {
@@ -99,6 +111,10 @@ impl Question {
             Self::SshCopyTarget => " Copy this key to a host ",
             Self::ItemFilter => " Filter items ",
             Self::NewKeyringLabel => " New keyring ",
+            Self::NewItemLabel => " New secret — 1 of 2: name ",
+            Self::NewItemAttributes => " New secret — 2 of 2: attributes ",
+            Self::ItemLabel => " Rename item ",
+            Self::ItemAttributes => " Edit attributes ",
         }
     }
 
@@ -121,6 +137,21 @@ impl Question {
                 "Creates an empty keyring. The service asks for its\n\
                  passphrase itself, through its own prompt."
             }
+            Self::NewItemLabel => {
+                "The name you will see in the list. The password is asked\n\
+                 for last, by secret-tool, not here."
+            }
+            Self::NewItemAttributes => {
+                "key=value pairs, space separated. The Secret Service\n\
+                 identifies an item by these, so at least one is needed:\n\
+                 service=github account=greg"
+            }
+            Self::ItemLabel => "Renames the item. Its attributes and secret are untouched.",
+            Self::ItemAttributes => {
+                "key=value pairs, space separated. This replaces the whole\n\
+                 set, which is all the Secret Service offers — so edit the\n\
+                 line rather than retyping it."
+            }
         }
     }
 
@@ -131,7 +162,8 @@ impl Question {
             Self::GpgSearch => "search",
             Self::SshCopyTarget => "[user@]host",
             Self::ItemFilter => "match",
-            Self::NewKeyringLabel => "name",
+            Self::NewKeyringLabel | Self::NewItemLabel | Self::ItemLabel => "name",
+            Self::NewItemAttributes | Self::ItemAttributes => "attributes",
         }
     }
 }
@@ -207,6 +239,18 @@ pub enum External {
     /// the new one. An empty new passphrase removes it, so this one command
     /// covers both changing and removing.
     SshPassphrase(PathBuf),
+    /// `secret-tool store --collection <path> --label <label> k v …`, which
+    /// reads the password from the terminal itself.
+    ///
+    /// This is how an item gets created without a passphrase box: the one
+    /// part keyring-tui must not ask for is the one part secret-tool asks for
+    /// on its own. The collection is a D-Bus object path because that is what
+    /// `--collection` takes — a label will not do.
+    SecretToolStore {
+        collection_path: String,
+        label: String,
+        attributes: Vec<(String, String)>,
+    },
 }
 
 impl External {
@@ -216,6 +260,7 @@ impl External {
             Self::SshKeygen { .. } | Self::SshPassphrase(_) => "ssh-keygen",
             Self::SshCopyId { .. } => "ssh-copy-id",
             Self::Gpg { .. } => "gpg",
+            Self::SecretToolStore { .. } => "secret-tool",
         }
     }
 
@@ -248,6 +293,26 @@ impl External {
                     path.display().to_string(),
                 ]
             }
+            Self::SecretToolStore {
+                collection_path,
+                label,
+                attributes,
+            } => {
+                let mut args = vec![
+                    "store".to_string(),
+                    "--collection".to_string(),
+                    collection_path.clone(),
+                    "--label".to_string(),
+                    label.clone(),
+                ];
+                // secret-tool takes attributes as alternating words rather
+                // than as `k=v`: the pairing is positional.
+                for (key, value) in attributes {
+                    args.push(key.clone());
+                    args.push(value.clone());
+                }
+                args
+            }
         }
     }
 
@@ -265,6 +330,7 @@ impl External {
             // The `encrypted` flag in the list changes, so it is re-read.
             | Self::SshPassphrase(_) => Refresh::SshKeys,
             Self::Gpg { .. } => Refresh::GpgKeys,
+            Self::SecretToolStore { .. } => Refresh::Keyrings,
         }
     }
 }
@@ -294,6 +360,9 @@ pub struct App {
     /// secret on screen as a side effect of a copy is the opposite of what
     /// was asked for.
     copy_on_reveal: bool,
+    /// The label typed in step one of creating an item, held while step two
+    /// asks for the attributes. Cleared when either step is cancelled.
+    new_item_label: Option<String>,
 
     // SSH keys.
     pub ssh_keys: Vec<SshKeyInfo>,
@@ -369,6 +438,7 @@ impl App {
             item_filter: String::new(),
             revealed: None,
             copy_on_reveal: false,
+            new_item_label: None,
             ssh_keys: Vec::new(),
             ssh_state: ListState::default(),
             agent: AgentStatus::NotConfigured,
@@ -651,6 +721,9 @@ impl App {
             }
             Action::DeleteKeyring => self.confirm(Prompt::ConfirmDeleteKeyring),
             Action::CopySecret => self.copy_secret(),
+            Action::NewItem => self.new_item(),
+            Action::RenameItem => self.rename_item(),
+            Action::EditAttributes => self.edit_attributes(),
 
             Action::CopySshKey => self.copy_ssh(false),
             Action::CopySshFingerprint => self.copy_ssh(true),
@@ -844,6 +917,69 @@ impl App {
                 self.status = format!("creating {answer}…");
                 self.send(SecretsRequest::CreateKeyring { label: answer });
             }
+
+            // Step one of creating an item: hold the label, ask for the rest.
+            Question::NewItemLabel => {
+                self.new_item_label = Some(answer);
+                self.ask(Question::NewItemAttributes, "");
+            }
+            Question::NewItemAttributes => {
+                let Some(label) = self.new_item_label.take() else {
+                    // The label went while this field was open — a refresh,
+                    // or a cancel that got ahead of us. Starting over beats
+                    // storing a secret under a name nobody chose.
+                    self.status = "start again: the name was lost".into();
+                    return;
+                };
+                let Some(collection_path) =
+                    self.selected_keyring().map(|keyring| keyring.path.clone())
+                else {
+                    return;
+                };
+                match crate::model::parse_attributes(&answer) {
+                    Ok(attributes) => {
+                        self.external = Some(External::SecretToolStore {
+                            collection_path,
+                            label,
+                            attributes,
+                        });
+                    }
+                    Err(err) => {
+                        // Put the field back with what was typed, rather than
+                        // throwing away both steps over a missing `=`.
+                        self.error = Some(err);
+                        self.new_item_label = Some(label);
+                        self.ask(Question::NewItemAttributes, &answer);
+                    }
+                }
+            }
+
+            Question::ItemLabel => {
+                let Some((keyring, item)) = self.selected_pair() else {
+                    return;
+                };
+                self.send(SecretsRequest::SetItemLabel {
+                    keyring,
+                    item,
+                    label: answer,
+                });
+            }
+            Question::ItemAttributes => {
+                let Some((keyring, item)) = self.selected_pair() else {
+                    return;
+                };
+                match crate::model::parse_attributes(&answer) {
+                    Ok(attributes) => self.send(SecretsRequest::SetItemAttributes {
+                        keyring,
+                        item,
+                        attributes,
+                    }),
+                    Err(err) => {
+                        self.error = Some(err);
+                        self.ask(Question::ItemAttributes, &answer);
+                    }
+                }
+            }
             // Handled above, before the empty-answer check.
             Question::ItemFilter => {}
         }
@@ -874,6 +1010,54 @@ impl App {
                 self.item_filter
             )
         };
+    }
+
+    /// Start creating an item: ask for a label, then for attributes, then
+    /// hand over to `secret-tool` for the password.
+    ///
+    /// Three steps because the password is the one thing that must not come
+    /// from this process's text field. A locked keyring is refused up front:
+    /// secret-tool would trigger an unlock prompt mid-flow, after two fields
+    /// have already been filled in.
+    fn new_item(&mut self) {
+        if self.section != Section::Keyrings {
+            return;
+        }
+        let Some(keyring) = self.selected_keyring() else {
+            return;
+        };
+        if keyring.locked {
+            let label = keyring.label.clone();
+            self.status = format!("{label} is locked — press u first");
+            return;
+        }
+        self.new_item_label = None;
+        self.ask(Question::NewItemLabel, "");
+    }
+
+    fn rename_item(&mut self) {
+        if self.section != Section::Keyrings {
+            return;
+        }
+        let Some(label) = self.selected_item().map(|item| item.label.clone()) else {
+            return;
+        };
+        // Pre-filled with the current name: a rename is usually a small edit.
+        self.ask(Question::ItemLabel, &label);
+    }
+
+    fn edit_attributes(&mut self) {
+        if self.section != Section::Keyrings {
+            return;
+        }
+        let Some(current) = self
+            .selected_item()
+            .map(|item| crate::model::format_attributes(item.attributes.iter()))
+        else {
+            return;
+        };
+        // Pre-filled with the whole set, because submitting replaces it.
+        self.ask(Question::ItemAttributes, &current);
     }
 
     /// Copy the selected item's secret.
@@ -1012,6 +1196,14 @@ impl App {
         self.status = "deleting…".into();
     }
 
+    /// The backend indices for the selected keyring and item together, which
+    /// every per-item request needs both halves of.
+    fn selected_pair(&self) -> Option<(usize, usize)> {
+        let keyring = self.selected_keyring()?.id;
+        let item = self.selected_item()?.id;
+        Some((keyring, item))
+    }
+
     /// Open a text field asking `question`, pre-filled with `initial`.
     fn ask(&mut self, question: Question, initial: &str) {
         self.input = Input::new(initial);
@@ -1020,6 +1212,9 @@ impl App {
 
     fn cancel_prompt(&mut self) {
         self.prompt = None;
+        // Abandoning either step of creating an item abandons both: a label
+        // with nothing to attach it to is not worth keeping.
+        self.new_item_label = None;
         self.status = "cancelled".into();
     }
 
@@ -1800,6 +1995,7 @@ mod tests {
             label: label.into(),
             locked,
             is_default: id == 0,
+            path: format!("/org/freedesktop/secrets/collection/c{id}"),
         }
     }
 
@@ -2593,6 +2789,271 @@ mod tests {
     }
 
     #[test]
+    fn creating_an_item_asks_for_a_name_then_attributes_then_hands_over() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('a'));
+        assert_eq!(
+            harness.app.prompt,
+            Some(Prompt::Ask(Question::NewItemLabel))
+        );
+
+        type_text(&mut harness, "GitHub token");
+        harness.press(KeyCode::Enter);
+        assert_eq!(
+            harness.app.prompt,
+            Some(Prompt::Ask(Question::NewItemAttributes)),
+            "the label alone is not enough to store anything"
+        );
+        assert!(
+            harness.secrets_requests().is_empty(),
+            "nothing is written until both fields are in"
+        );
+
+        type_text(&mut harness, "service=github account=greg");
+        harness.press(KeyCode::Enter);
+
+        let external = harness.app.take_external().expect("secret-tool");
+        assert_eq!(external.program(), "secret-tool");
+        assert_eq!(
+            external.args(),
+            vec![
+                "store",
+                "--collection",
+                "/org/freedesktop/secrets/collection/c0",
+                "--label",
+                "GitHub token",
+                "service",
+                "github",
+                "account",
+                "greg",
+            ],
+            "the collection is an object path, and attributes are positional"
+        );
+        assert_eq!(
+            external.refresh(),
+            Refresh::Keyrings,
+            "a new item means the list is stale"
+        );
+    }
+
+    #[test]
+    fn the_password_is_never_asked_for_by_keyring_tui() {
+        // The whole reason creating an item goes through secret-tool: no
+        // field in this process ever holds the secret.
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('a'));
+        type_text(&mut harness, "GitHub token");
+        harness.press(KeyCode::Enter);
+        type_text(&mut harness, "service=github");
+        harness.press(KeyCode::Enter);
+
+        assert_eq!(harness.app.prompt, None, "no third field appears");
+        let external = harness.app.take_external().expect("secret-tool");
+        assert!(
+            !external.args().iter().any(|arg| arg.contains("password")),
+            "and no password is passed on the command line: {:?}",
+            external.args()
+        );
+    }
+
+    #[test]
+    fn a_bad_attribute_line_reopens_the_field_with_what_was_typed() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('a'));
+        type_text(&mut harness, "GitHub token");
+        harness.press(KeyCode::Enter);
+
+        type_text(&mut harness, "service github");
+        harness.press(KeyCode::Enter);
+
+        assert_eq!(
+            harness.app.prompt,
+            Some(Prompt::Ask(Question::NewItemAttributes)),
+            "a missing = should not throw away both steps"
+        );
+        assert_eq!(harness.app.input.value(), "service github");
+        assert!(
+            harness
+                .app
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("not key=value")),
+            "{:?}",
+            harness.app.error
+        );
+        assert!(harness.app.take_external().is_none());
+
+        // And fixing it in place works, label still intact.
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut harness, "service=github");
+        harness.press(KeyCode::Enter);
+        let external = harness.app.take_external().expect("secret-tool");
+        assert!(external.args().contains(&"GitHub token".to_string()));
+    }
+
+    #[test]
+    fn cancelling_either_step_abandons_both() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('a'));
+        type_text(&mut harness, "GitHub token");
+        harness.press(KeyCode::Enter);
+        harness.press(KeyCode::Esc);
+        assert_eq!(harness.app.prompt, None);
+
+        // Starting again must not inherit the abandoned label.
+        harness.press(KeyCode::Char('a'));
+        type_text(&mut harness, "Other");
+        harness.press(KeyCode::Enter);
+        type_text(&mut harness, "service=other");
+        harness.press(KeyCode::Enter);
+
+        let external = harness.app.take_external().expect("secret-tool");
+        assert!(external.args().contains(&"Other".to_string()));
+        assert!(!external.args().contains(&"GitHub token".to_string()));
+    }
+
+    #[test]
+    fn a_locked_keyring_is_refused_before_any_typing() {
+        let mut harness = Harness::new();
+        harness
+            .app
+            .on_reply(Reply::Keyrings(vec![keyring(0, "Login", true)]));
+        harness.drain();
+
+        harness.press(KeyCode::Char('a'));
+        assert_eq!(
+            harness.app.prompt, None,
+            "better than unlocking halfway through two fields"
+        );
+        assert!(
+            harness.app.status.contains("locked"),
+            "{}",
+            harness.app.status
+        );
+    }
+
+    #[test]
+    fn renaming_sends_the_new_label() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('R'));
+        assert_eq!(harness.app.prompt, Some(Prompt::Ask(Question::ItemLabel)));
+        assert_eq!(
+            harness.app.input.value(),
+            "alpha",
+            "pre-filled, because a rename is usually a small edit"
+        );
+
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut harness, "alpha renamed");
+        harness.press(KeyCode::Enter);
+
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::SetItemLabel {
+                keyring: 0,
+                item: 0,
+                label: "alpha renamed".into()
+            }],
+            "a label may contain spaces; only attributes may not"
+        );
+    }
+
+    #[test]
+    fn editing_attributes_starts_from_the_current_set() {
+        let mut harness = filterable();
+        // Onto the row that has attributes.
+        harness.press(KeyCode::Char('l'));
+        harness.press(KeyCode::Char('j'));
+        harness.press(KeyCode::Char('j'));
+        assert_eq!(
+            harness.app.selected_item().map(|item| item.label.as_str()),
+            Some("GitLab token")
+        );
+        harness.drain();
+
+        harness.press(KeyCode::Char('A'));
+        assert_eq!(
+            harness.app.input.value(),
+            "service=gitlab.com",
+            "SetAttributes replaces the whole set, so the field must start \
+             from all of it"
+        );
+
+        type_text(&mut harness, " account=greg");
+        harness.press(KeyCode::Enter);
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::SetItemAttributes {
+                keyring: 0,
+                item: 2,
+                attributes: vec![
+                    ("service".into(), "gitlab.com".into()),
+                    ("account".into(), "greg".into()),
+                ]
+            }]
+        );
+    }
+
+    #[test]
+    fn a_bad_attribute_edit_is_not_sent() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('A'));
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut harness, "oops");
+        harness.press(KeyCode::Enter);
+
+        assert!(harness.secrets_requests().is_empty());
+        assert_eq!(
+            harness.app.prompt,
+            Some(Prompt::Ask(Question::ItemAttributes))
+        );
+        assert!(harness.app.error.is_some());
+    }
+
+    #[test]
+    fn clearing_the_attribute_line_is_refused_not_obeyed() {
+        // An item with no attributes has no identity in the Secret Service,
+        // so an empty line is an error rather than "remove them all".
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('A'));
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        harness.press(KeyCode::Enter);
+
+        assert!(harness.secrets_requests().is_empty());
+        assert_eq!(
+            harness.app.prompt, None,
+            "an empty field closes, as elsewhere"
+        );
+    }
+
+    #[test]
+    fn item_edits_need_a_selected_item() {
+        let mut harness = Harness::new();
+        harness
+            .app
+            .on_reply(Reply::Keyrings(vec![keyring(0, "Login", false)]));
+        harness.app.on_reply(Reply::Items {
+            keyring: 0,
+            items: Vec::new(),
+        });
+        harness.drain();
+
+        for code in [KeyCode::Char('R'), KeyCode::Char('A')] {
+            harness.press(code);
+            assert_eq!(harness.app.prompt, None, "nothing to edit");
+        }
+        assert!(harness.secrets_requests().is_empty());
+    }
+
+    #[test]
     fn revealing_a_secret_is_dropped_when_the_filter_changes() {
         let mut harness = filterable();
         harness.app.on_reply(Reply::Secret {
@@ -2845,9 +3306,36 @@ mod tests {
     }
 
     #[test]
-    fn ssh_bindings_do_nothing_in_the_passwords_section() {
+    fn a_adds_an_item_in_passwords_but_loads_the_agent_in_ssh() {
+        // `a`, `x` and `n` are all bound in both sections now; what matters
+        // is that each resolves to the one belonging to where the cursor is.
         let mut harness = Harness::loaded();
-        for code in [KeyCode::Char('a'), KeyCode::Char('x'), KeyCode::Char('n')] {
+        harness.press(KeyCode::Char('a'));
+        assert_eq!(
+            harness.app.prompt,
+            Some(Prompt::Ask(Question::NewItemLabel))
+        );
+        assert!(
+            harness.ssh_requests().is_empty(),
+            "nothing should reach the SSH backend from the Passwords section"
+        );
+
+        let mut harness = Harness::ssh_loaded();
+        // Onto id_rsa: key 0 is already loaded, and `a` rightly declines for
+        // one the agent holds.
+        harness.press(KeyCode::Char('j'));
+        harness.press(KeyCode::Char('a'));
+        assert!(harness.app.prompt.is_none());
+        let external = harness.app.take_external().expect("ssh-add");
+        assert_eq!(external.program(), "ssh-add");
+    }
+
+    #[test]
+    fn ssh_only_bindings_still_do_nothing_in_passwords() {
+        let mut harness = Harness::loaded();
+        // `c` is ssh-copy-id and `p` is the passphrase change; neither has a
+        // Passwords meaning, so both must be inert here.
+        for code in [KeyCode::Char('c'), KeyCode::Char('p')] {
             harness.press(code);
         }
         assert!(harness.app.take_external().is_none());

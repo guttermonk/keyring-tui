@@ -77,6 +77,9 @@ pub enum Action {
     NewKeyring,
     DeleteKeyring,
     CopySecret,
+    NewItem,
+    RenameItem,
+    EditAttributes,
 
     // SSH keys.
     AgentAdd,
@@ -145,6 +148,9 @@ impl Action {
             Self::NewKeyring => "new keyring",
             Self::DeleteKeyring => "delete the keyring and everything in it",
             Self::CopySecret => "copy the secret to the clipboard",
+            Self::NewItem => "store a new secret (runs secret-tool)",
+            Self::RenameItem => "rename the selected item",
+            Self::EditAttributes => "edit the selected item's attributes",
             Self::AgentAdd => "add to the ssh-agent (runs ssh-add)",
             Self::AgentRemove => "remove from the ssh-agent",
             Self::NewSshKey => "new SSH key (runs ssh-keygen)",
@@ -189,7 +195,10 @@ impl Action {
             | Self::DeleteItem
             | Self::NewKeyring
             | Self::DeleteKeyring
-            | Self::CopySecret => Some(Section::Keyrings),
+            | Self::CopySecret
+            | Self::NewItem
+            | Self::RenameItem
+            | Self::EditAttributes => Some(Section::Keyrings),
             Self::AgentAdd
             | Self::AgentRemove
             | Self::NewSshKey

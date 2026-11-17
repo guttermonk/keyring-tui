@@ -59,6 +59,11 @@ fn main() -> Keymap {
         // already the armoured export, so the fingerprint goes on `Y` — and
         // SSH mirrors it so `Y` means "the identifier" in both.
         bind(Action::CopySecret, "y"),
+        // `a` adds an item, as it adds to the agent in SSH; `n` is already
+        // the new *keyring* here, which is the bigger of the two things.
+        bind(Action::NewItem, "a"),
+        bind(Action::RenameItem, "R"),
+        bind(Action::EditAttributes, "A"),
         // SSH keys.
         bind(Action::AgentAdd, "a"),
         bind(Action::AgentRemove, "x"),

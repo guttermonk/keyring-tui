@@ -52,6 +52,62 @@ pub struct KeyringInfo {
     pub locked: bool,
     /// True for the collection aliased to `default`.
     pub is_default: bool,
+    /// The collection's D-Bus object path.
+    ///
+    /// Carried because `secret-tool store --collection` takes a full object
+    /// path or the literal `default` alias and nothing else — a label will
+    /// not do — and creating an item goes through that tool so the password
+    /// is never typed into this process.
+    pub path: String,
+}
+
+/// Parse a one-line `key=value key=value` attribute list.
+///
+/// Whitespace-separated pairs, split at the first `=` so a value may contain
+/// one. This is the form `secret-tool` itself takes attributes in, and it
+/// fits a single text field, which is what the UI has.
+///
+/// The limitation is real and worth knowing: a value cannot contain a space.
+/// Attributes are an item's *identity* in the Secret Service — `service`,
+/// `account`, `xdg:schema` — and are near-universally short tokens, so the
+/// trade buys a one-field editor at a cost that rarely bites. There is no
+/// quoting to learn and none to get wrong.
+pub fn parse_attributes(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    for token in text.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            return Err(format!("{token:?} is not key=value"));
+        };
+        if key.is_empty() {
+            return Err(format!("{token:?} has no attribute name"));
+        }
+        if out.iter().any(|(seen, _)| seen == key) {
+            // Silently keeping one of them would make the stored item differ
+            // from what the line says.
+            return Err(format!("{key:?} is given twice"));
+        }
+        out.push((key.to_owned(), value.to_owned()));
+    }
+
+    if out.is_empty() {
+        // Not a style rule: the Secret Service identifies an item by its
+        // attributes, and `secret-tool store` refuses without at least one.
+        return Err("at least one key=value attribute is needed".into());
+    }
+    Ok(out)
+}
+
+/// Render attributes back into the form [`parse_attributes`] accepts, so the
+/// edit field starts from what the item actually has.
+pub fn format_attributes<'a>(
+    attributes: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> String {
+    attributes
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A single stored secret. The secret value itself is deliberately absent:
@@ -308,6 +364,121 @@ pub struct GpgSubkey {
     pub expired: bool,
     pub has_secret: bool,
     pub on_card: bool,
+}
+
+#[cfg(test)]
+mod attribute_tests {
+    use super::*;
+
+    #[test]
+    fn parses_space_separated_pairs() {
+        assert_eq!(
+            parse_attributes("service=github account=greg").unwrap(),
+            vec![
+                ("service".to_string(), "github".to_string()),
+                ("account".to_string(), "greg".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_whitespace_is_not_an_error() {
+        assert_eq!(
+            parse_attributes("  service=github   account=greg  ")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_value_may_contain_an_equals_sign() {
+        // Split at the *first* `=`, so a base64 tail or a query string
+        // survives rather than being rejected as malformed.
+        assert_eq!(
+            parse_attributes("token=abc=def==").unwrap(),
+            vec![("token".to_string(), "abc=def==".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_colon_in_a_key_is_fine() {
+        // `xdg:schema` is the attribute the whole `kind()` column reads.
+        assert_eq!(
+            parse_attributes("xdg:schema=org.freedesktop.Secret.Generic").unwrap(),
+            vec![(
+                "xdg:schema".to_string(),
+                "org.freedesktop.Secret.Generic".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_empty_value_is_allowed() {
+        assert_eq!(
+            parse_attributes("service=").unwrap(),
+            vec![("service".to_string(), String::new())]
+        );
+    }
+
+    #[test]
+    fn a_token_with_no_equals_is_rejected() {
+        let err = parse_attributes("service github").unwrap_err();
+        assert!(err.contains("not key=value"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_key_is_rejected() {
+        let err = parse_attributes("=github").unwrap_err();
+        assert!(err.contains("no attribute name"), "{err}");
+    }
+
+    #[test]
+    fn a_repeated_key_is_rejected_rather_than_silently_collapsed() {
+        // Keeping one of them would store something other than what the
+        // line says.
+        let err = parse_attributes("service=a service=b").unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn nothing_at_all_is_rejected() {
+        // Not a style rule: the Secret Service identifies an item by its
+        // attributes, and secret-tool store refuses without one.
+        for empty in ["", "   "] {
+            let err = parse_attributes(empty).unwrap_err();
+            assert!(err.contains("at least one"), "{err}");
+        }
+    }
+
+    #[test]
+    fn formatting_round_trips_through_the_parser() {
+        let attributes: BTreeMap<String, String> = [
+            ("account".to_string(), "greg".to_string()),
+            ("service".to_string(), "github".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let line = format_attributes(attributes.iter());
+        assert_eq!(line, "account=greg service=github");
+        assert_eq!(
+            parse_attributes(&line).unwrap(),
+            vec![
+                ("account".to_string(), "greg".to_string()),
+                ("service".to_string(), "github".to_string()),
+            ],
+            "what the edit field is pre-filled with must parse back"
+        );
+    }
+
+    #[test]
+    fn a_value_with_a_space_is_the_known_limitation() {
+        // Documented, not supported: there is no quoting. It surfaces as a
+        // parse error on the second word rather than as silent truncation.
+        let err = parse_attributes("account=My Name").unwrap_err();
+        assert!(err.contains("not key=value"), "{err}");
+    }
 }
 
 #[cfg(test)]

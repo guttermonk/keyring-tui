@@ -160,7 +160,8 @@ preset = "terminal"
 #               SectionPasswords SectionGpgKeys SectionSshKeys
 #               MoveDown MoveUp First Last FocusLeft FocusRight
 #   Passwords   Unlock Lock ToggleSecret FilterItems DeleteItem
-#               NewKeyring DeleteKeyring CopySecret
+#               NewKeyring DeleteKeyring CopySecret NewItem
+#               RenameItem EditAttributes
 #   SSH Keys    AgentAdd AgentRemove NewSshKey SshCopyId SshPassphrase
 #               SshDelete CopySshKey CopySshFingerprint
 #   GPG Keys    GpgEdit GpgExport GpgPublish GpgDelete NewGpgKey

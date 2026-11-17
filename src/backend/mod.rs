@@ -52,6 +52,22 @@ pub enum SecretsRequest {
         keyring: usize,
         item: usize,
     },
+    /// Rename one item. Creating an item is absent on purpose: it needs a
+    /// secret, so it runs as an external `secret-tool store` that prompts
+    /// for the password itself. Changing a label or attributes needs no
+    /// secret, so it goes straight through D-Bus.
+    SetItemLabel {
+        keyring: usize,
+        item: usize,
+        label: String,
+    },
+    /// Replace one item's attributes wholesale, which is the only operation
+    /// the Secret Service offers — there is no per-attribute edit.
+    SetItemAttributes {
+        keyring: usize,
+        item: usize,
+        attributes: Vec<(String, String)>,
+    },
     /// Create an empty keyring. The service prompts for its passphrase
     /// through its own agent, so no secret passes through here.
     CreateKeyring {
