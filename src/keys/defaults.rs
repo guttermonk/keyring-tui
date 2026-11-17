@@ -83,6 +83,9 @@ fn main() -> Keymap {
         bind(Action::GpgImport, "i"),
         bind(Action::GpgSearch, "/"),
         bind(Action::CopyGpgFingerprint, "Y"),
+        // `S` for signatures: `s` is the Passwords reveal, so the shifted
+        // key is free here and reads the same way.
+        bind(Action::GpgSignatures, "S"),
     ])
 }
 

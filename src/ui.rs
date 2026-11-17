@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 use crate::app::{App, Pane, Prompt, Question};
 use crate::config::theme::Palette;
 use crate::keys::{Action, Mode};
-use crate::model::{AgentStatus, Section, format_timestamp};
+use crate::model::{AgentStatus, GpgSignature, Section, format_timestamp};
 
 pub fn draw(frame: &mut Frame, app: &mut App, p: &Palette) {
     // The base layer, so a preset's background covers the whole screen and
@@ -392,6 +392,50 @@ fn draw_gpg_keys(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     draw_gpg_detail(frame, right, app, p);
 }
 
+/// One certification, indented under the user ID it is on.
+///
+/// Self-signatures are dimmed whole: every user ID has one, so they are
+/// structure rather than information, and the eye should skip them to find
+/// the certifications that came from somebody else.
+fn signature_line(signature: &GpgSignature, p: &Palette) -> Line<'static> {
+    let mut spans = vec![Span::styled("      ", Style::default())];
+
+    let who = match &signature.signer_uid {
+        Some(uid) => uid.clone(),
+        // gpg cannot name a signer whose key is not in this keyring, which is
+        // the normal case for a stranger's certification.
+        None => format!("{}  (key not held)", signature.signer_key_id),
+    };
+    spans.push(if signature.self_signature {
+        Span::styled(who, p.dim_style())
+    } else {
+        Span::raw(who)
+    });
+
+    let mut tail = String::new();
+    if let Some(level) = signature.level() {
+        tail.push_str(&format!("  {level}"));
+    }
+    if signature.created.is_some() {
+        tail.push_str(&format!("  {}", format_timestamp(signature.created)));
+    }
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail, p.dim_style()));
+    }
+
+    for marker in signature.markers() {
+        let style = match marker {
+            // What makes a signature not count, in the colour the rest of the
+            // UI uses for exactly that.
+            "revocation" | "invalid" | "expired" => Style::default().fg(p.warn),
+            _ => p.dim_style(),
+        };
+        spans.push(Span::styled(format!(" [{marker}]"), style));
+    }
+
+    Line::from(spans)
+}
+
 fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     let Some(key) = app.selected_gpg_key() else {
         let message = if app.gpg_ready() {
@@ -447,7 +491,21 @@ fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
         "User IDs",
         Style::default().fg(p.accent),
     )));
+    // Only this key's signatures, and only if the cursor has not moved since
+    // they were asked for.
+    let signatures = app
+        .gpg_signatures
+        .as_ref()
+        .filter(|set| set.fingerprint == key.fingerprint);
+
     for uid in &key.uids {
+        let certified = signatures.and_then(|set| {
+            set.uids
+                .iter()
+                .find(|candidate| candidate.uid == uid.uid)
+                .map(|candidate| candidate.signatures.as_slice())
+        });
+
         let mut spans = vec![
             Span::styled("  ", Style::default()),
             Span::raw(uid.uid.clone()),
@@ -457,6 +515,35 @@ fn draw_gpg_detail(frame: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
             spans.push(Span::styled(" [revoked]", Style::default().fg(p.warn)));
         }
         lines.push(Line::from(spans));
+
+        for signature in certified.unwrap_or_default() {
+            lines.push(signature_line(signature, p));
+        }
+    }
+
+    if signatures.is_some() {
+        // Said once, under the list it explains: a self-signature is on every
+        // user ID by construction and vouches for nothing.
+        lines.push(Line::from(Span::styled(
+            "  [self] is the key signing its own user ID, not a vouch",
+            p.dim_style(),
+        )));
+    } else {
+        let hint = match app
+            .keymaps()
+            .get(Mode::Main)
+            .combos_for(Action::GpgSignatures)
+            .first()
+        {
+            Some(combo) if app.gpg_signatures_loading => {
+                format!("  reading signatures… ({combo} to cancel)")
+            }
+            Some(combo) => format!("  ({combo} to show who has certified these)"),
+            None => String::new(),
+        };
+        if !hint.is_empty() {
+            lines.push(Line::from(Span::styled(hint, p.dim_style())));
+        }
     }
 
     lines.push(Line::raw(""));
@@ -602,6 +689,7 @@ fn hint_line(app: &App) -> String {
             (Action::GpgExport, "export"),
             (Action::NewGpgKey, "new"),
             (Action::CopyGpgFingerprint, "copy fpr"),
+            (Action::GpgSignatures, "sigs"),
         ],
     };
     for (action, label) in section_actions {
@@ -1308,6 +1396,130 @@ mod tests {
         let screen = render(&mut app);
         assert!(screen.contains("reading"), "{screen}");
         assert!(!screen.contains("No keys in the GnuPG keyring"), "{screen}");
+    }
+
+    /// A GPG key with one user ID, so the signature rendering has something
+    /// to nest under.
+    fn gpg_key_with_uid(uid: &str) -> GpgKeyInfo {
+        GpgKeyInfo {
+            uids: vec![GpgUid {
+                uid: uid.into(),
+                validity: "ultimate",
+                revoked: false,
+            }],
+            ..gpg_key(uid)
+        }
+    }
+
+    fn signature(
+        signer_uid: Option<&str>,
+        self_signature: bool,
+        cert_class: u64,
+    ) -> crate::model::GpgSignature {
+        crate::model::GpgSignature {
+            signer_key_id: "BEEF0123BEEF4567".into(),
+            signer_uid: signer_uid.map(str::to_owned),
+            created: Some(std::time::Duration::from_secs(1_700_000_000)),
+            expires: None,
+            self_signature,
+            revocation: false,
+            expired: false,
+            invalid: false,
+            cert_class,
+            exportable: true,
+        }
+    }
+
+    #[test]
+    fn an_unloaded_key_offers_the_key_that_loads_its_signatures() {
+        let mut app = app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        app.on_reply(Reply::GpgKeys {
+            keys: vec![gpg_key_with_uid("Greg <greg@example>")],
+            filter: crate::model::GpgFilter::All,
+            engine: "gpg 2.4.9".into(),
+        });
+
+        let screen = render(&mut app);
+        assert!(
+            screen.contains("to show who has certified"),
+            "the detail pane should say how to get them:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn loaded_signatures_nest_under_their_user_id() {
+        let mut app = app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        app.on_reply(Reply::GpgKeys {
+            keys: vec![gpg_key_with_uid("Greg <greg@example>")],
+            filter: crate::model::GpgFilter::All,
+            engine: "gpg 2.4.9".into(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
+        app.on_reply(Reply::GpgSignatures(crate::model::GpgSignatureSet {
+            fingerprint: "A9F0DB57379512B0DFBFA6CDE18D94492C20F0FC".into(),
+            uids: vec![crate::model::GpgUidSignatures {
+                uid: "Greg <greg@example>".into(),
+                signatures: vec![
+                    signature(Some("Greg <greg@example>"), true, 0x13),
+                    signature(Some("Friend <f@example>"), false, 0x12),
+                    // A stranger: gpg has no name for a key it does not hold.
+                    signature(None, false, 0x10),
+                ],
+            }],
+        }));
+
+        let screen = render(&mut app);
+        assert!(screen.contains("Friend <f@example>"), "{screen}");
+        assert!(screen.contains("casual"), "the level is shown:\n{screen}");
+        assert!(
+            screen.contains("key not held"),
+            "an unnameable signer says why:\n{screen}"
+        );
+        assert!(
+            screen.contains("[self]"),
+            "and the self-signature is marked:\n{screen}"
+        );
+        assert!(
+            screen.contains("not a vouch"),
+            "with one line explaining what that means:\n{screen}"
+        );
+        assert!(
+            !screen.contains("to show who has certified"),
+            "the load hint is gone once they are up:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_revoked_signature_is_marked() {
+        let mut app = app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        app.on_reply(Reply::GpgKeys {
+            keys: vec![gpg_key_with_uid("Greg <greg@example>")],
+            filter: crate::model::GpgFilter::All,
+            engine: "gpg 2.4.9".into(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
+        app.on_reply(Reply::GpgSignatures(crate::model::GpgSignatureSet {
+            fingerprint: "A9F0DB57379512B0DFBFA6CDE18D94492C20F0FC".into(),
+            uids: vec![crate::model::GpgUidSignatures {
+                uid: "Greg <greg@example>".into(),
+                signatures: vec![crate::model::GpgSignature {
+                    revocation: true,
+                    exportable: false,
+                    ..signature(Some("Friend <f@example>"), false, 0x30)
+                }],
+            }],
+        }));
+
+        let screen = render(&mut app);
+        assert!(screen.contains("[revocation]"), "{screen}");
+        assert!(screen.contains("[local]"), "{screen}");
+        assert!(
+            !screen.contains("generic") && !screen.contains("positive"),
+            "0x30 is not a certification level, so none is claimed:\n{screen}"
+        );
     }
 
     fn gpg_key(uid: &str) -> GpgKeyInfo {

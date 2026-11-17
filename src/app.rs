@@ -21,7 +21,7 @@ use crate::backend::{ClipboardRequest, GpgRequest, Refresh, Reply, SecretsReques
 use crate::input::Input;
 use crate::keys::{Action, Key, Keymaps, Mode, ModifiedKey, Resolution};
 use crate::model::{
-    AgentStatus, GpgFilter, GpgKeyInfo, ItemInfo, KeyringInfo, Section, SshKeyInfo,
+    AgentStatus, GpgFilter, GpgKeyInfo, GpgSignatureSet, ItemInfo, KeyringInfo, Section, SshKeyInfo,
 };
 
 /// Which pane has the keyboard. `h`/`l` walk this left to right.
@@ -306,6 +306,12 @@ pub struct App {
     pub gpg_keys: Vec<GpgKeyInfo>,
     pub gpg_state: ListState,
     pub gpg_filter: GpgFilter,
+    /// Certifications for the selected key, once asked for. One key at a
+    /// time: it is dropped whenever the cursor moves, so this never grows and
+    /// never shows one key's signatures against another.
+    pub gpg_signatures: Option<GpgSignatureSet>,
+    /// A request is out and the pane should say so rather than look empty.
+    pub gpg_signatures_loading: bool,
     /// The gpg engine behind the current listing, for the status line.
     pub gpg_engine: String,
     /// The GPG section reads the keyring on first visit, not at startup.
@@ -370,6 +376,8 @@ impl App {
             gpg_keys: Vec::new(),
             gpg_state: ListState::default(),
             gpg_filter: GpgFilter::All,
+            gpg_signatures: None,
+            gpg_signatures_loading: false,
             gpg_engine: String::new(),
             gpg_loaded: false,
             status: "loading keyrings…".into(),
@@ -489,8 +497,14 @@ impl App {
     }
 
     /// Forget any revealed secret. Called on every navigation.
-    fn hide_secret(&mut self) {
+    /// Drop everything that belonged to the row the cursor was on.
+    ///
+    /// Called from every navigation path, so anything fetched for one row can
+    /// never be shown against the next: a revealed secret, and a key's
+    /// certifications. One hook rather than two flags to keep in step.
+    fn clear_row_state(&mut self) {
         self.revealed = None;
+        self.drop_gpg_signatures();
     }
 
     /// Hand the parked external command to the event loop, if there is one.
@@ -641,6 +655,7 @@ impl App {
             Action::CopySshKey => self.copy_ssh(false),
             Action::CopySshFingerprint => self.copy_ssh(true),
             Action::CopyGpgFingerprint => self.copy_gpg_fingerprint(),
+            Action::GpgSignatures => self.toggle_gpg_signatures(),
 
             Action::AgentAdd => self.add_to_agent(),
             Action::SshCopyId => self.copy_key_to_host(),
@@ -840,7 +855,7 @@ impl App {
     /// just been filtered out from under it.
     fn set_item_filter(&mut self, filter: String) {
         self.item_filter = filter;
-        self.hide_secret();
+        self.clear_row_state();
 
         let visible = self.visible_items().len();
         if visible == 0 {
@@ -913,6 +928,48 @@ impl App {
         self.copy(Zeroizing::new(text), what, false);
     }
 
+    /// Load the selected key's certifications, or drop them if they are
+    /// already up.
+    ///
+    /// A toggle rather than a plain load, because the signatures can be a
+    /// long list and the detail pane is shared with everything else about the
+    /// key. It is also why this is on a key at all instead of being fetched
+    /// on selection: `KeyListMode::SIGS` makes gpg read signature packets,
+    /// which is not something to do on every press of `j`.
+    fn toggle_gpg_signatures(&mut self) {
+        if self.section != Section::GpgKeys {
+            return;
+        }
+        let Some(fingerprint) = self.selected_gpg_key().map(|key| key.fingerprint.clone()) else {
+            return;
+        };
+
+        // A request still in flight counts as "on", so the same key cancels
+        // it rather than queueing a second listing behind the first.
+        if self.gpg_signatures.is_some() || self.gpg_signatures_loading {
+            let was_loading = self.gpg_signatures_loading;
+            self.drop_gpg_signatures();
+            self.detail_scroll = 0;
+            self.status = if was_loading {
+                "stopped reading signatures".into()
+            } else {
+                "signatures hidden".into()
+            };
+            return;
+        }
+
+        self.gpg_signatures_loading = true;
+        self.send_gpg(GpgRequest::ListSignatures { fingerprint });
+        self.status = "reading signatures…".into();
+    }
+
+    /// Forget any loaded signatures. Called wherever the selected key can
+    /// change, so one key's certifications are never shown under another.
+    fn drop_gpg_signatures(&mut self) {
+        self.gpg_signatures = None;
+        self.gpg_signatures_loading = false;
+    }
+
     fn copy_gpg_fingerprint(&mut self) {
         if self.section != Section::GpgKeys {
             return;
@@ -932,7 +989,7 @@ impl App {
         let Some(keyring) = self.selected_keyring().map(|keyring| keyring.id) else {
             return;
         };
-        self.hide_secret();
+        self.clear_row_state();
         self.send(SecretsRequest::DeleteKeyring { keyring });
         self.status = "deleting…".into();
     }
@@ -948,7 +1005,7 @@ impl App {
         let Some(item) = self.selected_item().map(|item| item.id) else {
             return;
         };
-        self.hide_secret();
+        self.clear_row_state();
         let _ = self
             .secrets
             .send(SecretsRequest::DeleteItem { keyring, item });
@@ -1012,7 +1069,7 @@ impl App {
         if self.section == section {
             return;
         }
-        self.hide_secret();
+        self.clear_row_state();
         self.section = section;
         self.error = None;
         // Each section has its own set of panes, so focus starts at its left.
@@ -1057,7 +1114,7 @@ impl App {
             return;
         }
 
-        self.hide_secret();
+        self.clear_row_state();
         self.pane = panes[next];
         self.detail_scroll = 0;
 
@@ -1080,7 +1137,7 @@ impl App {
             return;
         }
 
-        self.hide_secret();
+        self.clear_row_state();
         self.detail_scroll = 0;
         match (self.section, self.pane) {
             (Section::Keyrings, Pane::Keyrings) => {
@@ -1118,7 +1175,7 @@ impl App {
             return;
         }
 
-        self.hide_secret();
+        self.clear_row_state();
         self.detail_scroll = 0;
         let (state, len) = match (self.section, self.pane) {
             (Section::Keyrings, Pane::Keyrings) => (&mut self.keyring_state, self.keyrings.len()),
@@ -1141,7 +1198,7 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        self.hide_secret();
+        self.clear_row_state();
         self.error = None;
         match self.section {
             Section::Keyrings => {
@@ -1193,7 +1250,7 @@ impl App {
         else {
             return;
         };
-        self.hide_secret();
+        self.clear_row_state();
         self.status = format!("{} {label}…", if locked { "locking" } else { "unlocking" });
         self.send(if locked {
             SecretsRequest::Lock { keyring: id }
@@ -1207,7 +1264,7 @@ impl App {
             return;
         }
         if self.revealed.is_some() {
-            self.hide_secret();
+            self.clear_row_state();
             return;
         }
         let Some(keyring) = self.selected_keyring().map(|k| k.id) else {
@@ -1514,6 +1571,31 @@ impl App {
                 }
             }
 
+            Reply::GpgSignatures(set) => {
+                // Nothing is waiting for this: the request was cancelled, or
+                // navigation dropped it. The reply still arrives — gpg was
+                // already working — and is simply not wanted.
+                if !self.gpg_signatures_loading {
+                    return;
+                }
+                self.gpg_signatures_loading = false;
+
+                // The listing is for one key; if the cursor has moved on it
+                // is not ours to show either.
+                if self.selected_gpg_key().map(|key| key.fingerprint.as_str())
+                    != Some(set.fingerprint.as_str())
+                {
+                    return;
+                }
+                self.status = match set.foreign_count() {
+                    0 => "no certifications beyond the key's own".to_string(),
+                    1 => "1 certification by someone else".to_string(),
+                    other => format!("{other} certifications by others"),
+                };
+                self.gpg_signatures = Some(set);
+                self.detail_scroll = 0;
+            }
+
             Reply::Status { message, refresh } => {
                 self.error = None;
                 self.status = message;
@@ -1521,7 +1603,7 @@ impl App {
             }
 
             Reply::Error(message) => {
-                self.hide_secret();
+                self.clear_row_state();
                 self.error = Some(message);
             }
         }
@@ -3110,6 +3192,189 @@ mod tests {
             harness.ssh_requests(),
             vec![SshRequest::DeleteKey { key: 1 }]
         );
+    }
+
+    fn signature_set(fingerprint: &str, uid: &str, foreign: usize) -> GpgSignatureSet {
+        let mut signatures = vec![crate::model::GpgSignature {
+            signer_key_id: "KEYID0".into(),
+            signer_uid: Some(uid.to_owned()),
+            created: None,
+            expires: None,
+            self_signature: true,
+            revocation: false,
+            expired: false,
+            invalid: false,
+            cert_class: 0x13,
+            exportable: true,
+        }];
+        for n in 0..foreign {
+            signatures.push(crate::model::GpgSignature {
+                signer_key_id: format!("OTHER{n}"),
+                signer_uid: Some(format!("Friend {n} <f{n}@example>")),
+                self_signature: false,
+                ..signatures[0].clone()
+            });
+        }
+        GpgSignatureSet {
+            fingerprint: fingerprint.to_owned(),
+            uids: vec![crate::model::GpgUidSignatures {
+                uid: uid.to_owned(),
+                signatures,
+            }],
+        }
+    }
+
+    #[test]
+    fn s_asks_for_the_selected_keys_signatures() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('S'));
+
+        assert_eq!(
+            harness.gpg_requests(),
+            vec![GpgRequest::ListSignatures {
+                fingerprint: "FPR0".into()
+            }]
+        );
+        assert!(harness.app.gpg_signatures_loading);
+
+        harness.app.on_reply(Reply::GpgSignatures(signature_set(
+            "FPR0",
+            "Me <me@example>",
+            2,
+        )));
+        assert!(!harness.app.gpg_signatures_loading);
+        assert_eq!(
+            harness
+                .app
+                .gpg_signatures
+                .as_ref()
+                .map(|set| set.foreign_count()),
+            Some(2)
+        );
+        assert!(
+            harness.app.status.contains("2 certifications"),
+            "{}",
+            harness.app.status
+        );
+    }
+
+    #[test]
+    fn s_again_hides_them_without_a_second_listing() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('S'));
+        harness.app.on_reply(Reply::GpgSignatures(signature_set(
+            "FPR0",
+            "Me <me@example>",
+            1,
+        )));
+        harness.drain();
+
+        harness.press(KeyCode::Char('S'));
+        assert!(harness.app.gpg_signatures.is_none());
+        assert!(
+            harness.gpg_requests().is_empty(),
+            "hiding is local; nothing needs re-reading"
+        );
+    }
+
+    #[test]
+    fn s_while_loading_cancels_rather_than_queueing() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('S'));
+        harness.drain();
+
+        harness.press(KeyCode::Char('S'));
+        assert!(!harness.app.gpg_signatures_loading);
+        assert!(
+            harness.gpg_requests().is_empty(),
+            "a second press must not start a second listing"
+        );
+
+        // gpg was already working, so the reply still turns up — and must be
+        // ignored rather than appearing after the cancel.
+        harness.app.on_reply(Reply::GpgSignatures(signature_set(
+            "FPR0",
+            "Me <me@example>",
+            1,
+        )));
+        assert!(harness.app.gpg_signatures.is_none());
+    }
+
+    #[test]
+    fn signatures_for_a_key_the_cursor_left_are_dropped() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('S'));
+        harness.drain();
+
+        // Moving the cursor is itself what forgets the pending request.
+        harness.press(KeyCode::Char('j'));
+        assert!(!harness.app.gpg_signatures_loading);
+
+        harness.app.on_reply(Reply::GpgSignatures(signature_set(
+            "FPR0",
+            "Me <me@example>",
+            1,
+        )));
+        assert!(
+            harness.app.gpg_signatures.is_none(),
+            "FPR1 is selected now; FPR0's signatures are not its own"
+        );
+    }
+
+    #[test]
+    fn moving_the_cursor_forgets_loaded_signatures() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('S'));
+        harness.app.on_reply(Reply::GpgSignatures(signature_set(
+            "FPR0",
+            "Me <me@example>",
+            1,
+        )));
+        assert!(harness.app.gpg_signatures.is_some());
+
+        harness.press(KeyCode::Char('j'));
+        assert!(
+            harness.app.gpg_signatures.is_none(),
+            "one key's certifications must never show under another"
+        );
+    }
+
+    #[test]
+    fn leaving_the_section_forgets_them_too() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('S'));
+        harness.app.on_reply(Reply::GpgSignatures(signature_set(
+            "FPR0",
+            "Me <me@example>",
+            1,
+        )));
+
+        harness.press(KeyCode::Char('1'));
+        assert!(harness.app.gpg_signatures.is_none());
+    }
+
+    #[test]
+    fn a_key_nobody_has_certified_says_so() {
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('S'));
+        harness.app.on_reply(Reply::GpgSignatures(signature_set(
+            "FPR0",
+            "Me <me@example>",
+            0,
+        )));
+        assert!(
+            harness.app.status.contains("no certifications"),
+            "a self-signature is not a certification: {}",
+            harness.app.status
+        );
+    }
+
+    #[test]
+    fn s_does_nothing_outside_the_gpg_section() {
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('S'));
+        assert!(harness.gpg_requests().is_empty());
+        assert!(!harness.app.gpg_signatures_loading);
     }
 
     // --- Navigation and keybindings --------------------------------------

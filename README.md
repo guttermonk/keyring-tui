@@ -83,6 +83,7 @@ In **GPG Keys**:
 | `i` | import keys from a file — asks for a path (`gpg --import`) |
 | `/` | search a keyserver — asks for a query (`gpg --search-keys`) |
 | `Y` | copy the fingerprint to the clipboard |
+| `S` | show / hide who has certified this key |
 
 A key that opens a text field puts the keymap into **`input` mode**, where
 printable keys are literal text rather than bindings — so `q` types a `q`
@@ -336,9 +337,22 @@ permanent. A near-miss on the harmless one should not be destructive.
 - [x] print the armoured public key
 - [x] publish to a keyserver, and delete a key, both behind a confirmation
 - [x] import from a file, and keyserver search
-- [ ] per-user-ID signature listing, which is Seahorse's "Signatures" tab
+- [x] per-user-ID signature listing, which is Seahorse's "Signatures" tab
+- [x] copy a fingerprint to the clipboard
 - [ ] photo IDs
 - [ ] S/MIME keys, which gpgme exposes through `Protocol::CMS`
+
+Signatures are loaded per key with `S` rather than shown automatically.
+`KeyListMode::SIGS` makes gpg read signature packets, which is affordable
+for one key and not for a whole keyring — and the cursor moves far more
+often than anyone asks who signed something. They are dropped again as
+soon as the cursor moves, so one key's certifications can never appear
+under another.
+
+Self-signatures are listed but dimmed and marked `[self]`: every user ID
+carries one by construction, so they are structure rather than evidence.
+The status line counts only the certifications that came from somebody
+else, which is the number that says anything about a web of trust.
 
 ## Tests
 
@@ -347,17 +361,28 @@ cargo test                                                  # no D-Bus, agent, g
 cargo test --test secret_service -- --ignored --nocapture    # live keyring, metadata only
 cargo test ssh::tests::live -- --ignored --nocapture         # live ~/.ssh and agent
 cargo test gpg::tests::live -- --ignored --nocapture         # live ~/.gnupg
+cargo test gpg::tests::signatures_against -- --ignored       # generates a throwaway keyring
+cargo test clipboard -- --ignored --nocapture                # live clipboard
 ```
 
 The default suite covers the state machine against fake backends, the SSH
 scanner against key fixtures in a temporary directory, ssh-agent wire-format
 parsing, and rendering through ratatui's `TestBackend`.
 
-The ignored tests read from your real environment and are deliberately
+Most of the ignored tests read from your real environment and are deliberately
 side-effect free: the keyring one reads labels, lock state and item counts
 without fetching a secret or unlocking anything; the SSH ones read key
 metadata and ask the agent what it holds, with the removal test using a
-fixture key the agent cannot be holding; the GPG one only lists keys.
+fixture key the agent cannot be holding; the GPG ones only list keys and
+signatures.
+
+Two are not read-only, and say so in their names. The signature test
+generates two keys in a **temporary** GnuPG home and has one certify the
+other — it points one gpgme context at that directory with
+`set_engine_home_dir` rather than setting `GNUPGHOME`, which is
+process-wide and would not be safe while other tests run, so your own
+keyring is never touched. The clipboard test writes to your real
+clipboard and clears it again.
 
 To exercise the GPG section — including the operations that write — point it
 at a throwaway keyring rather than your own:

@@ -98,6 +98,7 @@ pub enum Action {
     GpgImport,
     GpgSearch,
     CopyGpgFingerprint,
+    GpgSignatures,
 
     // Prompts.
     Confirm,
@@ -161,6 +162,7 @@ impl Action {
             Self::GpgImport => "import keys from a file",
             Self::GpgSearch => "search a keyserver",
             Self::CopyGpgFingerprint => "copy the fingerprint to the clipboard",
+            Self::GpgSignatures => "show / hide who has certified this key",
             Self::Confirm => "confirm",
             Self::Cancel => "cancel",
             Self::Choose1 => "first choice",
@@ -204,7 +206,8 @@ impl Action {
             | Self::GpgImport
             | Self::GpgSearch
             | Self::ToggleGpgFilter
-            | Self::CopyGpgFingerprint => Some(Section::GpgKeys),
+            | Self::CopyGpgFingerprint
+            | Self::GpgSignatures => Some(Section::GpgKeys),
             _ => None,
         }
     }

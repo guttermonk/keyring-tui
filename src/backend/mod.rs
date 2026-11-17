@@ -22,7 +22,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
-use crate::model::{AgentStatus, GpgFilter, GpgKeyInfo, ItemInfo, KeyringInfo, SshKeyInfo};
+use crate::model::{
+    AgentStatus, GpgFilter, GpgKeyInfo, GpgSignatureSet, ItemInfo, KeyringInfo, SshKeyInfo,
+};
 
 /// Commands for the Secret Service backend.
 #[derive(Debug, PartialEq, Eq)]
@@ -90,7 +92,14 @@ pub enum ClipboardRequest {
 /// `gpg` command with the TUI suspended. See [`crate::app::GpgAction`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum GpgRequest {
-    ListKeys { filter: GpgFilter },
+    ListKeys {
+        filter: GpgFilter,
+    },
+    /// The certifications on one key. Separate from the listing because it
+    /// needs `KeyListMode::SIGS`, which is too expensive keyring-wide.
+    ListSignatures {
+        fingerprint: String,
+    },
 }
 
 /// Commands for the SSH backend.
@@ -139,6 +148,10 @@ pub enum Reply {
         /// The gpg engine behind the listing, for the status line.
         engine: String,
     },
+    /// The certifications on one key, as asked for by
+    /// [`GpgRequest::ListSignatures`]. Carries its own fingerprint so a
+    /// reply for a key the cursor has left can be dropped.
+    GpgSignatures(GpgSignatureSet),
     /// Transient message for the status line, plus whatever the operation
     /// invalidated. A backend says what to re-read rather than the UI
     /// guessing, so a lock in one section cannot trigger a reload in another.

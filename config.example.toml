@@ -165,6 +165,7 @@ preset = "terminal"
 #               SshDelete CopySshKey CopySshFingerprint
 #   GPG Keys    GpgEdit GpgExport GpgPublish GpgDelete NewGpgKey
 #               ToggleGpgFilter GpgImport GpgSearch CopyGpgFingerprint
+#               GpgSignatures
 #
 # Actions in the `prompt` mode: Confirm Cancel Choose1 Choose2 Choose3.
 #

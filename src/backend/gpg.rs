@@ -18,22 +18,25 @@
 //! Seahorse's key-edit surface — with gpg's own prompts and safeguards. See
 //! [`crate::app::GpgAction`].
 //!
+//! Listing is split in two for cost. The key list runs without
+//! `KeyListMode::SIGS`, because that mode makes gpg read every signature
+//! packet in the keyring; signatures are then fetched for one key at a time,
+//! when asked for.
+//!
 //! Still missing, and worth adding next:
 //!
-//! - [ ] import from a file, and keyserver search (`gpgme` can do the latter
-//!   with `KeyListMode::EXTERN`; both need a text input widget first)
 //! - [ ] photo IDs
-//! - [ ] signature listing per user ID (`KeyListMode::SIGS`), which is what
-//!   Seahorse's "Signatures" tab shows
 //! - [ ] S/MIME keys, which gpgme exposes through `Protocol::CMS`
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use gpgme::{Context, Key, KeyListMode, Protocol, Validity};
+use gpgme::{Context, Key, KeyListMode, Protocol, UserIdSignature, Validity};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use super::{GpgRequest, Replies, Reply};
-use crate::model::{GpgFilter, GpgKeyInfo, GpgSubkey, GpgUid};
+use crate::model::{
+    GpgFilter, GpgKeyInfo, GpgSignature, GpgSignatureSet, GpgSubkey, GpgUid, GpgUidSignatures,
+};
 
 /// Spawn the backend actor and return the handle the UI sends requests on.
 pub fn spawn(replies: Replies) -> UnboundedSender<GpgRequest> {
@@ -58,8 +61,82 @@ async fn run(mut rx: UnboundedReceiver<GpgRequest>, replies: Replies) {
                     Err(err) => Reply::Error(format!("listing GPG keys panicked: {err}")),
                 }
             }
+            GpgRequest::ListSignatures { fingerprint } => {
+                let wanted = fingerprint.clone();
+                match tokio::task::spawn_blocking(move || list_signatures(&wanted)).await {
+                    Ok(Ok(uids)) => Reply::GpgSignatures(GpgSignatureSet { fingerprint, uids }),
+                    Ok(Err(err)) => Reply::Error(err),
+                    Err(err) => Reply::Error(format!("listing signatures panicked: {err}")),
+                }
+            }
         };
         let _ = replies.send(reply);
+    }
+}
+
+/// The certifications on one key, user ID by user ID.
+///
+/// `SIGS` is set only here. On the whole-keyring listing it would make gpg
+/// parse every signature packet it owns, which on a keyring with a few
+/// well-connected keys is the difference between instant and several seconds.
+fn list_signatures(fingerprint: &str) -> Result<Vec<GpgUidSignatures>, String> {
+    let mut ctx = Context::from_protocol(Protocol::OpenPgp)
+        .map_err(|err| format!("cannot talk to gpg: {err}"))?;
+    ctx.set_key_list_mode(KeyListMode::LOCAL | KeyListMode::SIGS)
+        .map_err(|err| format!("cannot set the key list mode: {err}"))?;
+
+    let key = ctx
+        .get_key(fingerprint)
+        .map_err(|err| format!("cannot read {fingerprint}: {err}"))?;
+
+    // Every self-signature carries the primary key's ID, but gpg reports the
+    // *signing* subkey, so match against all of them rather than just the
+    // primary — a key that certifies with a subkey would otherwise look as
+    // though a stranger had signed it.
+    let own: Vec<String> = std::iter::once(key.id().unwrap_or_default().to_owned())
+        .chain(
+            key.subkeys()
+                .filter_map(|subkey| subkey.id().ok().map(str::to_owned)),
+        )
+        .filter(|id| !id.is_empty())
+        .collect();
+
+    Ok(key
+        .user_ids()
+        .map(|uid| GpgUidSignatures {
+            uid: uid.id().unwrap_or("<unreadable>").to_owned(),
+            signatures: uid
+                .signatures()
+                .map(|signature| describe_signature(&signature, &own))
+                .collect(),
+        })
+        .collect())
+}
+
+fn describe_signature(signature: &UserIdSignature<'_>, own: &[String]) -> GpgSignature {
+    let signer_key_id = signature.signer_key_id().unwrap_or("?").to_owned();
+
+    GpgSignature {
+        self_signature: own.contains(&signer_key_id),
+        // An empty user ID is gpg saying "I do not have that key", which is
+        // the normal case for a signature from a stranger. `None` says that
+        // better than a blank line would.
+        signer_uid: signature
+            .signer_user_id()
+            .ok()
+            .map(str::trim)
+            .filter(|uid| !uid.is_empty())
+            .map(str::to_owned),
+        signer_key_id,
+        created: epoch_seconds(signature.creation_time()),
+        expires: epoch_seconds(signature.expiration_time()),
+        revocation: signature.is_revocation(),
+        expired: signature.is_expired(),
+        // `is_bad` folds in the cases gpgme could not check at all, which for
+        // a reader amounts to the same warning as an outright invalid one.
+        invalid: signature.is_invalid() || signature.is_bad(),
+        cert_class: signature.cert_class(),
+        exportable: signature.is_exportable(),
     }
 }
 
@@ -249,6 +326,190 @@ mod tests {
             None,
             "a time before the epoch is not a usable timestamp"
         );
+    }
+
+    /// Build a throwaway keyring with two keys, one certifying the other, and
+    /// check the signature listing against it.
+    ///
+    /// Ignored by default because it shells out to `gpg` and generates keys,
+    /// which takes a second or two. Run with
+    ///
+    /// ```console
+    /// cargo test gpg::tests::signatures_against -- --ignored --nocapture
+    /// ```
+    ///
+    /// `set_engine_home_dir` points one gpgme context at the temporary home,
+    /// so this never reads or writes the real `~/.gnupg` and does not touch
+    /// `GNUPGHOME` — which, being process-wide, would not be safe to set
+    /// while other tests run.
+    #[test]
+    #[ignore = "generates keys in a temporary GnuPG home"]
+    fn signatures_against_a_generated_keyring() {
+        use std::process::Command;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let home_path = home.path().to_str().expect("utf-8 tempdir");
+
+        // 0700, or gpg refuses the home directory outright.
+        std::fs::set_permissions(
+            home.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod");
+
+        let gpg = |args: &[&str]| {
+            let output = Command::new("gpg")
+                .args(["--homedir", home_path, "--batch", "--yes"])
+                .args(args)
+                .output()
+                .expect("run gpg");
+            assert!(
+                output.status.success(),
+                "gpg {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+
+        // Two keys with no passphrase, then one certifies the other.
+        for address in ["signed@example.invalid", "signer@example.invalid"] {
+            gpg(&[
+                "--passphrase",
+                "",
+                "--quick-generate-key",
+                address,
+                "ed25519",
+                "default",
+                "never",
+            ]);
+        }
+        // The fingerprint of the signed key, from gpg's own colon output.
+        // `--quick-sign-key` insists on a fingerprint rather than an address,
+        // so this has to come first.
+        let listing = gpg(&["--with-colons", "--list-keys", "signed@example.invalid"]);
+        let fingerprint = listing
+            .lines()
+            .find(|line| line.starts_with("fpr:"))
+            .and_then(|line| line.split(':').nth(9))
+            .expect("a fingerprint")
+            .to_owned();
+
+        gpg(&[
+            "--default-key",
+            "signer@example.invalid",
+            "--quick-sign-key",
+            &fingerprint,
+        ]);
+
+        // The same work `list_signatures` does, against the temporary home.
+        let mut ctx = Context::from_protocol(Protocol::OpenPgp).expect("context");
+        ctx.set_engine_home_dir(home_path).expect("home dir");
+        ctx.set_key_list_mode(KeyListMode::LOCAL | KeyListMode::SIGS)
+            .expect("key list mode");
+        let key = ctx.get_key(&fingerprint).expect("the signed key");
+        let own: Vec<String> = std::iter::once(key.id().unwrap_or_default().to_owned())
+            .chain(
+                key.subkeys()
+                    .filter_map(|subkey| subkey.id().ok().map(str::to_owned)),
+            )
+            .filter(|id| !id.is_empty())
+            .collect();
+
+        let uids: Vec<GpgUidSignatures> = key
+            .user_ids()
+            .map(|uid| GpgUidSignatures {
+                uid: uid.id().unwrap_or("<unreadable>").to_owned(),
+                signatures: uid
+                    .signatures()
+                    .map(|signature| describe_signature(&signature, &own))
+                    .collect(),
+            })
+            .collect();
+
+        assert_eq!(uids.len(), 1, "one user ID was generated");
+        let signatures = &uids[0].signatures;
+        for signature in signatures {
+            println!(
+                "{:<18} {:<30} self={:<5} {:<9} {}",
+                signature.signer_key_id,
+                signature.signer_uid.as_deref().unwrap_or("(key not held)"),
+                signature.self_signature,
+                signature.level().unwrap_or("—"),
+                signature.markers().join(" "),
+            );
+        }
+
+        let own_sigs: Vec<_> = signatures.iter().filter(|s| s.self_signature).collect();
+        let foreign: Vec<_> = signatures.iter().filter(|s| !s.self_signature).collect();
+
+        assert!(
+            !own_sigs.is_empty(),
+            "the key's own self-signature must be recognised as one"
+        );
+        assert_eq!(
+            foreign.len(),
+            1,
+            "exactly one other key certified this user ID"
+        );
+
+        let certification = foreign[0];
+        assert!(
+            certification
+                .signer_uid
+                .as_deref()
+                .is_some_and(|uid| uid.contains("signer@example.invalid")),
+            "the signer is in this keyring, so gpg can name them: {:?}",
+            certification.signer_uid
+        );
+        assert!(
+            certification.level().is_some(),
+            "a certification carries one of gpg's four levels, got class {:#x}",
+            certification.cert_class
+        );
+        assert!(certification.exportable, "--quick-sign-key is not an lsign");
+        assert!(!certification.revocation);
+        assert!(!certification.expired);
+        assert!(!certification.invalid);
+    }
+
+    /// Lists the certifications on every key in the developer's real
+    /// keyring. Ignored by default; reads metadata only.
+    #[tokio::test]
+    #[ignore = "reads the developer's real ~/.gnupg"]
+    async fn live_signature_listing() {
+        let (keys, _) = list_keys(GpgFilter::All).expect("listing");
+        if keys.is_empty() {
+            println!("no keys in this keyring; nothing to list signatures for");
+            return;
+        }
+
+        for key in &keys {
+            let uids = list_signatures(&key.fingerprint).expect("signatures");
+            assert_eq!(
+                uids.len(),
+                key.uids.len(),
+                "the SIGS listing should report the same user IDs as the plain one"
+            );
+
+            println!("{}", key.primary_uid);
+            for uid in &uids {
+                println!("  {}  ({} signature(s))", uid.uid, uid.signatures.len());
+                assert!(
+                    uid.signatures.iter().any(|sig| sig.self_signature),
+                    "every user ID carries a self-signature, so detecting \
+                     none means the key-ID match is wrong"
+                );
+                for sig in &uid.signatures {
+                    println!(
+                        "    {:<18} {:<28} {:<9} {}",
+                        sig.signer_key_id,
+                        sig.signer_uid.as_deref().unwrap_or("(key not held)"),
+                        sig.level().unwrap_or("—"),
+                        sig.markers().join(" "),
+                    );
+                }
+            }
+        }
     }
 
     /// Smoke test against the developer's real `~/.gnupg`. Ignored by
