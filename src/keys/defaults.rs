@@ -57,6 +57,10 @@ fn main() -> Keymap {
         bind(Action::AgentRemove, "x"),
         bind(Action::NewSshKey, "n"),
         bind(Action::SshCopyId, "c"),
+        bind(Action::SshPassphrase, "p"),
+        // Not `x`: that is the harmless "remove from the agent" in this
+        // section, and a near-miss on it should not unlink a private key.
+        bind(Action::SshDelete, "D"),
         // GPG keys. `n` and `x` are shared with SSH: each section acts on its
         // own list, and no section has both bindings live at once.
         bind(Action::NewGpgKey, "n"),

@@ -80,6 +80,8 @@ pub enum Action {
     AgentRemove,
     NewSshKey,
     SshCopyId,
+    SshPassphrase,
+    SshDelete,
 
     // GPG keys.
     GpgEdit,
@@ -137,6 +139,8 @@ impl Action {
             Self::AgentRemove => "remove from the ssh-agent",
             Self::NewSshKey => "new SSH key (runs ssh-keygen)",
             Self::SshCopyId => "copy this key to a host (runs ssh-copy-id)",
+            Self::SshPassphrase => "change or remove the passphrase (runs ssh-keygen -p)",
+            Self::SshDelete => "delete the key files",
             Self::GpgEdit => "edit: trust, expiry, UIDs, revoke, certify",
             Self::GpgExport => "print the armoured public key",
             Self::GpgPublish => "publish to a keyserver",
@@ -169,9 +173,12 @@ impl Action {
             | Self::ToggleSecret
             | Self::FilterItems
             | Self::DeleteItem => Some(Section::Keyrings),
-            Self::AgentAdd | Self::AgentRemove | Self::NewSshKey | Self::SshCopyId => {
-                Some(Section::SshKeys)
-            }
+            Self::AgentAdd
+            | Self::AgentRemove
+            | Self::NewSshKey
+            | Self::SshCopyId
+            | Self::SshPassphrase
+            | Self::SshDelete => Some(Section::SshKeys),
             Self::GpgEdit
             | Self::GpgExport
             | Self::GpgPublish

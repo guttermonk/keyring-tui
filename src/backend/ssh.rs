@@ -17,11 +17,15 @@
 //!   a security key, so it runs as an external `ssh-add` with the TUI
 //!   suspended rather than through this module.
 //!
-//! Still on the list, in rough order of usefulness: change or remove a key's
-//! passphrase, deploy a public key to a remote host (`ssh-copy-id`), and
-//! delete a key. Note that hardware-backed keys (`*-sk`) can be listed and
-//! loaded but never re-encrypted, so passphrase operations must be hidden for
-//! them rather than failing at the end.
+//! Deleting a key is the one write this module does: it unlinks the files,
+//! having first asked the agent to forget the key. Everything else that
+//! changes a key — generating one, changing a passphrase, deploying a public
+//! half to a host — is an external command run with the TUI suspended.
+//!
+//! Hardware-backed keys (`*-sk`) need no special casing for passphrases, as
+//! was once assumed here: the file holds a credential handle rather than a
+//! secret scalar, and `ssh-keygen -p` re-encrypts it like any other key file,
+//! with no token present and no touch.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -45,12 +49,16 @@ async fn run(mut rx: UnboundedReceiver<SshRequest>, replies: Replies) {
     // the UI is showing. Removing from the agent needs the wire blob, not the
     // file, so that forwarded keys with no file on disk can be removed too.
     let mut blobs: Vec<Vec<u8>> = Vec::new();
+    // The same listing, kept because deleting needs the paths and deleting
+    // has to agree with what the user was looking at when they confirmed.
+    let mut listed: Vec<SshKeyInfo> = Vec::new();
 
     while let Some(request) = rx.recv().await {
         let reply = match request {
             SshRequest::ListKeys => match list_keys().await {
                 Ok((keys, agent, new_blobs)) => {
                     blobs = new_blobs;
+                    listed = keys.clone();
                     Reply::SshKeys { keys, agent }
                 }
                 Err(err) => Reply::Error(err),
@@ -65,9 +73,97 @@ async fn run(mut rx: UnboundedReceiver<SshRequest>, replies: Replies) {
                 },
                 None => Reply::Error("key is no longer loaded; press r to refresh".into()),
             },
+            SshRequest::DeleteKey { key } => {
+                match (listed.get(key), blobs.get(key)) {
+                    (Some(info), Some(blob)) => delete_key(info, blob).await,
+                    // The two vectors are filled together, so this is a stale
+                    // index rather than a mismatch.
+                    _ => Reply::Error(stale()),
+                }
+            }
         };
         let _ = replies.send(reply);
     }
+}
+
+fn stale() -> String {
+    "key is no longer in the list; press r to refresh".into()
+}
+
+/// Unlink a key's files, having first asked the agent to forget it.
+///
+/// The agent step is best-effort: it may legitimately not hold the key, and a
+/// refusal there must not stop the files going. The order matters the other
+/// way round, though — once the `.pub` is gone the user has no easy way to
+/// name the key to `ssh-add -d`.
+async fn delete_key(info: &SshKeyInfo, blob: &[u8]) -> Reply {
+    let mut notes: Vec<String> = Vec::new();
+
+    if info.in_agent {
+        match agent::remove(blob).await {
+            Ok(()) => notes.push("dropped from the agent".into()),
+            Err(err) => notes.push(format!("agent kept it ({err})")),
+        }
+    }
+
+    let paths: Vec<PathBuf> = [info.private_path.clone(), info.public_path.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if paths.is_empty() {
+        return Reply::Error(format!("{} has no files to delete", info.name));
+    }
+
+    let dir = match ssh_dir() {
+        Ok(dir) => dir,
+        Err(err) => return Reply::Error(err),
+    };
+
+    let name = info.name.clone();
+    let removed = match tokio::task::spawn_blocking(move || unlink_all(&dir, &paths)).await {
+        Ok(Ok(removed)) => removed,
+        Ok(Err(err)) => return Reply::Error(err),
+        Err(err) => return Reply::Error(format!("deleting {name} panicked: {err}")),
+    };
+
+    notes.insert(0, format!("deleted {removed} file(s)"));
+    Reply::Status {
+        message: format!("{}: {}", info.name, notes.join(", ")),
+        refresh: Refresh::SshKeys,
+    }
+}
+
+/// Remove each path, refusing anything that is not a plain file directly
+/// inside `dir`.
+///
+/// The paths come from our own scan of that directory, so the check should
+/// never fire — which is exactly why it is cheap to keep. It is the last gate
+/// before an unlink, and a stale index or a path that grew a `..` is not
+/// something to discover afterwards.
+pub(crate) fn unlink_all(dir: &Path, paths: &[PathBuf]) -> Result<usize, String> {
+    let mut removed = 0;
+
+    for path in paths {
+        if path.parent() != Some(dir) {
+            return Err(format!("{} is not in {}", path.display(), dir.display()));
+        }
+        // `symlink_metadata`, not `metadata`: a symlink is removed as the
+        // link it is, and must not be judged by what it points at.
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => {
+                return Err(format!("{} is a directory", path.display()));
+            }
+            // Already gone: someone else deleted it, which is the outcome we
+            // wanted anyway.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("{}: {err}", path.display())),
+            Ok(_) => {}
+        }
+        std::fs::remove_file(path).map_err(|err| format!("{}: {err}", path.display()))?;
+        removed += 1;
+    }
+
+    Ok(removed)
 }
 
 type Listing = (Vec<SshKeyInfo>, AgentStatus, Vec<Vec<u8>>);
@@ -763,6 +859,82 @@ uWwKduVS0HyAGTXOaRlSJ2/86cXDuYr5Dhm0BeWZr8gnjedjHowJsabeoGs=
             Ok(()) => panic!("the agent claimed to hold the test fixture key"),
             Err(other) => panic!("unexpected failure: {other}"),
         }
+    }
+
+    #[test]
+    fn unlink_removes_the_pair_and_leaves_the_rest_alone() {
+        let dir = fixture_dir();
+        let path = dir.path();
+
+        let removed = unlink_all(
+            path,
+            &[path.join("id_ed25519"), path.join("id_ed25519.pub")],
+        )
+        .unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!path.join("id_ed25519").exists());
+        assert!(!path.join("id_ed25519.pub").exists());
+        assert!(path.join("id_ecdsa").exists(), "the other pair stays");
+        assert!(path.join("config").exists());
+        assert!(path.join("known_hosts").exists());
+    }
+
+    #[test]
+    fn unlink_refuses_a_path_outside_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("precious");
+        fs::write(&victim, "do not touch").unwrap();
+
+        let err = unlink_all(dir.path(), std::slice::from_ref(&victim)).unwrap_err();
+        assert!(err.contains("is not in"), "{err}");
+        assert!(victim.exists(), "the file must survive the refusal");
+    }
+
+    #[test]
+    fn unlink_refuses_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+
+        let err = unlink_all(dir.path(), std::slice::from_ref(&nested)).unwrap_err();
+        assert!(err.contains("is a directory"), "{err}");
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn unlink_treats_an_already_missing_file_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("id_ed25519"), ED25519_PRIVATE).unwrap();
+
+        // The `.pub` was never there, which is the state after a half-finished
+        // delete or a private-key-only setup.
+        let removed = unlink_all(
+            dir.path(),
+            &[
+                dir.path().join("id_ed25519"),
+                dir.path().join("id_ed25519.pub"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(removed, 1, "only the file that existed is counted");
+    }
+
+    #[test]
+    fn unlink_removes_a_symlink_rather_than_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("real_key");
+        fs::write(&target, ED25519_PRIVATE).unwrap();
+
+        let link = dir.path().join("id_ed25519");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let removed = unlink_all(dir.path(), std::slice::from_ref(&link)).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!link.exists(), "the link is gone");
+        assert!(target.exists(), "what it pointed at is not ours to delete");
     }
 
     #[test]

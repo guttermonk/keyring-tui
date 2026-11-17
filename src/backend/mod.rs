@@ -69,6 +69,12 @@ pub enum SshRequest {
     RemoveFromAgent {
         key: usize,
     },
+    /// Unlink a key's files. Gated behind a confirmation in the UI, and the
+    /// agent's copy is dropped first — once the files are gone there is no
+    /// convenient way left to ask the agent to forget it.
+    DeleteKey {
+        key: usize,
+    },
 }
 
 /// Results flowing back from a backend to the event loop.

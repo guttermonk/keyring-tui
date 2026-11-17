@@ -59,6 +59,8 @@ In **SSH Keys**:
 | `x` | remove the selected key from the agent |
 | `n` | generate a key (runs `ssh-keygen`) |
 | `c` | copy the public key to a host — asks for `[user@]host` (`ssh-copy-id`) |
+| `p` | change or remove the passphrase (`ssh-keygen -p`) |
+| `D` | delete the key files — asks first |
 
 In **GPG Keys**:
 
@@ -227,6 +229,11 @@ affected list is re-read when they exit. That keeps passphrases and private
 key material out of this process entirely, and means `-sk` keys, askpass,
 pinentry and gpg's own confirmations all behave exactly as usual.
 
+The exception is the operations that need no secret to carry out: deleting a
+stored secret and unlinking a key's files happen in the backends, since there
+is no prompt for an external command to show. Both are gated behind a
+confirmation instead.
+
 It also sets the boundary for the GPG section: reading goes through `gpgme`,
 because structured access to user IDs, subkeys, capabilities and validity is
 worth a library; writing goes through `gpg --edit-key` and friends, because
@@ -269,10 +276,14 @@ or `secret-tool` remains the way to do that.
 - [x] show which keys the agent holds, including forwarded agent-only keys
 - [x] add to the agent (`ssh-add`) and remove from it (agent protocol)
 - [x] generate a key (ed25519 / ecdsa p521 / rsa 4096, via `ssh-keygen`)
-- [ ] change or remove a key's passphrase
+- [x] change or remove a key's passphrase (`ssh-keygen -p`)
 - [x] deploy a public key to a remote host (`ssh-copy-id`)
-- [ ] delete a key
+- [x] delete a key, behind a confirmation
 - [ ] copy the public key or fingerprint to the clipboard
+
+`x` and `D` are deliberately different keys. `x` removes a key from the
+agent, which costs you a re-`ssh-add`; `D` unlinks the files, which is
+permanent. A near-miss on the harmless one should not be destructive.
 
 **GPG keys**
 

@@ -592,6 +592,7 @@ fn hint_line(app: &App) -> String {
             (Action::AgentAdd, "add"),
             (Action::AgentRemove, "remove"),
             (Action::NewSshKey, "new"),
+            (Action::SshPassphrase, "passphrase"),
         ],
         Section::GpgKeys => &[
             (Action::GpgEdit, "edit"),
@@ -713,6 +714,23 @@ fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt, p: &Pal
                 format!("{item}\n\n{DELETE_ITEM_PROMPT}"),
             )
         }
+        Prompt::ConfirmSshDelete => {
+            // The files are the whole point of the question, so they are
+            // listed rather than summarised.
+            let mut body = String::new();
+            if let Some(key) = app.selected_ssh_key() {
+                for path in [&key.private_path, &key.public_path].into_iter().flatten() {
+                    body.push_str(&format!("{}\n", path.display()));
+                }
+                if key.in_agent {
+                    body.push_str("\nThe agent is holding it, and will be asked to forget it.\n");
+                }
+            }
+            (
+                " Delete SSH key ".to_string(),
+                format!("{body}\n{DELETE_SSH_KEY_PROMPT}"),
+            )
+        }
     };
 
     // The prose is written out; the keys come from the prompt keymap, so a
@@ -728,7 +746,9 @@ fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: Prompt, p: &Pal
         ],
         Prompt::ConfirmGpgDelete => &[(Action::Confirm, "delete"), (Action::Cancel, "cancel")],
         Prompt::ConfirmGpgPublish => &[(Action::Confirm, "publish"), (Action::Cancel, "cancel")],
-        Prompt::ConfirmDeleteItem => &[(Action::Confirm, "delete"), (Action::Cancel, "cancel")],
+        Prompt::ConfirmDeleteItem | Prompt::ConfirmSshDelete => {
+            &[(Action::Confirm, "delete"), (Action::Cancel, "cancel")]
+        }
     };
 
     let map = app.keymaps().get(Mode::Prompt);
@@ -876,6 +896,12 @@ key, and every user ID on it, stays public.
 const DELETE_ITEM_PROMPT: &str = "\
 Deletes this secret from the keyring. There is no trash and no
 undo, and whatever stored it will have to be told again.
+";
+
+const DELETE_SSH_KEY_PROMPT: &str = "\
+Unlinks the files above. A private key cannot be regenerated:
+anything still trusting it — authorized_keys on a host, a
+deploy key, a signed commit — has to be reissued.
 ";
 
 #[cfg(test)]
@@ -1066,6 +1092,42 @@ mod tests {
             "the modal must name what goes:\n{screen}"
         );
         assert!(screen.contains("no trash"), "{screen}");
+    }
+
+    #[test]
+    fn the_ssh_delete_confirmation_lists_the_files() {
+        let mut app = app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        app.on_reply(Reply::SshKeys {
+            keys: vec![SshKeyInfo {
+                id: 0,
+                name: "id_ed25519".into(),
+                private_path: Some("/home/u/.ssh/id_ed25519".into()),
+                public_path: Some("/home/u/.ssh/id_ed25519.pub".into()),
+                algorithm: "ssh-ed25519".into(),
+                bits: Some(256),
+                comment: "u@host".into(),
+                public_line: "ssh-ed25519 AAAA u@host".into(),
+                fingerprint: "SHA256:abc".into(),
+                encrypted: true,
+                hardware_backed: false,
+                in_agent: true,
+            }],
+            agent: AgentStatus::Ready { loaded: 1 },
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+
+        let screen = render(&mut app);
+        assert!(screen.contains("Delete SSH key"), "{screen}");
+        assert!(
+            screen.contains("id_ed25519.pub"),
+            "both files have to be named:\n{screen}"
+        );
+        assert!(
+            screen.contains("forget it"),
+            "and the agent copy mentioned:\n{screen}"
+        );
+        assert!(screen.contains("cannot be regenerated"), "{screen}");
     }
 
     fn item(label: &str) -> ItemInfo {

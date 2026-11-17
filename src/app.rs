@@ -59,6 +59,9 @@ pub enum Prompt {
     /// Confirm deleting the selected stored secret. Nothing else asks: the
     /// Secret Service deletes on request, with no trash to recover from.
     ConfirmDeleteItem,
+    /// Confirm unlinking the selected SSH key's files. A private key is the
+    /// one thing here that no amount of re-running can get back.
+    ConfirmSshDelete,
     /// A one-line text field. The text itself lives in [`App::input`] so that
     /// this enum stays `Copy`.
     Ask(Question),
@@ -188,13 +191,17 @@ pub enum External {
     /// `ssh-copy-id -i <public_key> <target>`, which asks the remote host for
     /// a password itself.
     SshCopyId { public_key: PathBuf, target: String },
+    /// `ssh-keygen -p -f <path>`, which asks for the old passphrase and then
+    /// the new one. An empty new passphrase removes it, so this one command
+    /// covers both changing and removing.
+    SshPassphrase(PathBuf),
 }
 
 impl External {
     pub fn program(&self) -> &'static str {
         match self {
             Self::SshAdd(_) => "ssh-add",
-            Self::SshKeygen { .. } => "ssh-keygen",
+            Self::SshKeygen { .. } | Self::SshPassphrase(_) => "ssh-keygen",
             Self::SshCopyId { .. } => "ssh-copy-id",
             Self::Gpg { .. } => "gpg",
         }
@@ -222,6 +229,13 @@ impl External {
                     target.clone(),
                 ]
             }
+            Self::SshPassphrase(path) => {
+                vec![
+                    "-p".to_string(),
+                    "-f".to_string(),
+                    path.display().to_string(),
+                ]
+            }
         }
     }
 
@@ -233,7 +247,11 @@ impl External {
     /// What this command may have changed, so the right list is re-read.
     pub fn refresh(&self) -> Refresh {
         match self {
-            Self::SshAdd(_) | Self::SshKeygen { .. } | Self::SshCopyId { .. } => Refresh::SshKeys,
+            Self::SshAdd(_)
+            | Self::SshKeygen { .. }
+            | Self::SshCopyId { .. }
+            // The `encrypted` flag in the list changes, so it is re-read.
+            | Self::SshPassphrase(_) => Refresh::SshKeys,
             Self::Gpg { .. } => Refresh::GpgKeys,
         }
     }
@@ -575,6 +593,8 @@ impl App {
             Action::AgentAdd => self.add_to_agent(),
             Action::SshCopyId => self.copy_key_to_host(),
             Action::AgentRemove => self.remove_from_agent(),
+            Action::SshPassphrase => self.change_ssh_passphrase(),
+            Action::SshDelete => self.confirm(Prompt::ConfirmSshDelete),
             Action::NewSshKey => {
                 if self.section == Section::SshKeys {
                     self.prompt = Some(Prompt::NewSshKey);
@@ -662,6 +682,14 @@ impl App {
                 Action::Confirm => {
                     self.prompt = None;
                     self.delete_item();
+                }
+                Action::Cancel => self.cancel_prompt(),
+                _ => {}
+            },
+            Prompt::ConfirmSshDelete => match action {
+                Action::Confirm => {
+                    self.prompt = None;
+                    self.delete_ssh_key();
                 }
                 Action::Cancel => self.cancel_prompt(),
                 _ => {}
@@ -807,6 +835,27 @@ impl App {
             }
             Prompt::ConfirmDeleteItem => {
                 self.section == Section::Keyrings && self.selected_item().is_some()
+            }
+            Prompt::ConfirmSshDelete if self.section != Section::SshKeys => false,
+            Prompt::ConfirmSshDelete => {
+                let on_disk = self.selected_ssh_key().map(|key| {
+                    (
+                        key.name.clone(),
+                        key.private_path.is_some() || key.public_path.is_some(),
+                    )
+                });
+                match on_disk {
+                    // An agent-only identity has no files to unlink; `x` is
+                    // what gets rid of that one, and saying so beats a modal
+                    // that would have nothing to delete.
+                    Some((name, false)) => {
+                        self.status =
+                            format!("{name} has no files on disk; x drops it from the agent");
+                        false
+                    }
+                    Some((_, true)) => true,
+                    None => false,
+                }
             }
             // Neither of these is a confirmation; they are opened directly.
             Prompt::NewSshKey | Prompt::Ask(_) => false,
@@ -1096,6 +1145,41 @@ impl App {
             return;
         }
         self.ask(Question::SshCopyTarget, "");
+    }
+
+    /// Hand the key to `ssh-keygen -p`, which asks for the old passphrase and
+    /// then the new one.
+    ///
+    /// No confirmation: it is reversible by running it again, and ssh-keygen
+    /// will not get anywhere without the current passphrase anyway. Hardware
+    /// keys need no special case — their file holds a credential handle, not
+    /// a secret, and re-encrypting it needs no token.
+    fn change_ssh_passphrase(&mut self) {
+        if self.section != Section::SshKeys {
+            return;
+        }
+        let Some((name, path)) = self
+            .selected_ssh_key()
+            .map(|key| (key.name.clone(), key.private_path().map(ToOwned::to_owned)))
+        else {
+            return;
+        };
+        // A passphrase protects the private half; a lone `.pub` has none, and
+        // neither does an identity that only exists in the agent.
+        let Some(path) = path else {
+            self.status = format!("{name} has no private key file to re-encrypt");
+            return;
+        };
+        self.external = Some(External::SshPassphrase(path));
+    }
+
+    /// Ask the backend to unlink the selected key's files.
+    fn delete_ssh_key(&mut self) {
+        let Some(id) = self.selected_ssh_key().map(|key| key.id) else {
+            return;
+        };
+        self.status = "deleting…".into();
+        self.send_ssh(SshRequest::DeleteKey { key: id });
     }
 
     fn generate_ssh_key(&mut self, algorithm: &'static str, bits: Option<u32>) {
@@ -2381,12 +2465,9 @@ mod tests {
     #[test]
     fn gpg_bindings_do_nothing_in_the_other_sections() {
         let mut harness = Harness::ssh_loaded();
-        for code in [
-            KeyCode::Char('e'),
-            KeyCode::Char('y'),
-            KeyCode::Char('p'),
-            KeyCode::Char('f'),
-        ] {
+        // Not `p`: that is shared with SshPassphrase, and
+        // `p_publishes_in_gpg_but_re_encrypts_in_ssh` covers the split.
+        for code in [KeyCode::Char('e'), KeyCode::Char('y'), KeyCode::Char('f')] {
             harness.press(code);
         }
         assert!(harness.app.take_external().is_none());
@@ -2407,6 +2488,125 @@ mod tests {
         let mut harness = Harness::gpg_loaded();
         harness.press(KeyCode::Char('x'));
         assert_eq!(harness.app.prompt, Some(Prompt::ConfirmGpgDelete));
+    }
+
+    #[test]
+    fn p_changes_the_passphrase_without_asking_first() {
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('p'));
+
+        assert_eq!(
+            harness.app.prompt, None,
+            "ssh-keygen gets nowhere without the current passphrase, so \
+             there is nothing to guard against"
+        );
+        let external = harness.app.take_external().expect("an external command");
+        assert_eq!(external.program(), "ssh-keygen");
+        assert_eq!(
+            external.args(),
+            vec!["-p", "-f", "/home/u/.ssh/id_ecdsa"],
+            "the private half is what carries the passphrase"
+        );
+        assert_eq!(external.refresh(), Refresh::SshKeys);
+    }
+
+    #[test]
+    fn a_key_with_no_private_half_cannot_be_re_encrypted() {
+        let mut harness = Harness::new();
+        harness.press(KeyCode::Char('3'));
+        harness.app.on_reply(Reply::SshKeys {
+            keys: vec![ssh_key(0, "id_ed25519", false, false)],
+            agent: AgentStatus::Ready { loaded: 0 },
+        });
+        harness.drain();
+
+        harness.press(KeyCode::Char('p'));
+        assert!(harness.app.take_external().is_none());
+        assert!(
+            harness.app.status.contains("no private key file"),
+            "{}",
+            harness.app.status
+        );
+    }
+
+    #[test]
+    fn p_publishes_in_gpg_but_re_encrypts_in_ssh() {
+        // Both are bound to `p`; the section decides which one fires.
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('p'));
+        assert_eq!(harness.app.prompt, Some(Prompt::ConfirmGpgPublish));
+        assert!(harness.app.take_external().is_none());
+
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('p'));
+        assert_eq!(harness.app.prompt, None);
+        assert!(harness.app.take_external().is_some());
+    }
+
+    #[test]
+    fn deleting_an_ssh_key_asks_first() {
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('D'));
+        assert_eq!(harness.app.prompt, Some(Prompt::ConfirmSshDelete));
+        assert!(
+            harness.ssh_requests().is_empty(),
+            "nothing is unlinked until it is confirmed"
+        );
+
+        harness.press(KeyCode::Char('y'));
+        assert_eq!(harness.app.prompt, None);
+        assert_eq!(
+            harness.ssh_requests(),
+            vec![SshRequest::DeleteKey { key: 0 }]
+        );
+    }
+
+    #[test]
+    fn cancelling_the_ssh_delete_unlinks_nothing() {
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('D'));
+        harness.press(KeyCode::Char('n'));
+        assert_eq!(harness.app.prompt, None);
+        assert!(harness.ssh_requests().is_empty());
+    }
+
+    #[test]
+    fn an_agent_only_identity_has_no_files_to_delete() {
+        let mut harness = Harness::new();
+        harness.press(KeyCode::Char('3'));
+        let mut forwarded = ssh_key(0, "(agent) forwarded@elsewhere", false, true);
+        forwarded.public_path = None;
+        harness.app.on_reply(Reply::SshKeys {
+            keys: vec![forwarded],
+            agent: AgentStatus::Ready { loaded: 1 },
+        });
+        harness.drain();
+
+        harness.press(KeyCode::Char('D'));
+        assert_eq!(
+            harness.app.prompt, None,
+            "there is nothing on disk to confirm deleting"
+        );
+        assert!(harness.ssh_requests().is_empty());
+        assert!(
+            harness.app.status.contains("x drops it from the agent"),
+            "the status should point at the thing that does work: {}",
+            harness.app.status
+        );
+    }
+
+    #[test]
+    fn deleting_the_second_key_sends_its_own_id() {
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('j'));
+        harness.drain();
+
+        harness.press(KeyCode::Char('D'));
+        harness.press(KeyCode::Enter); // Enter confirms, like y
+        assert_eq!(
+            harness.ssh_requests(),
+            vec![SshRequest::DeleteKey { key: 1 }]
+        );
     }
 
     // --- Navigation and keybindings --------------------------------------
