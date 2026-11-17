@@ -11,11 +11,15 @@
 //! Requests are per-backend; replies share one channel so the event loop has a
 //! single place to wait.
 
+pub mod clipboard;
 pub mod gpg;
 pub mod secrets;
 pub mod ssh;
 
+use std::time::Duration;
+
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 use crate::model::{AgentStatus, GpgFilter, GpgKeyInfo, ItemInfo, KeyringInfo, SshKeyInfo};
@@ -55,6 +59,29 @@ pub enum SecretsRequest {
     DeleteKeyring {
         keyring: usize,
     },
+}
+
+/// Commands for the clipboard backend.
+///
+/// Not `PartialEq`: a request carries a secret, and a derived comparison is
+/// an easy way to leak one into a test assertion's failure output.
+#[derive(Debug)]
+pub enum ClipboardRequest {
+    /// Put `text` on the clipboard. `what` names it for the status line and
+    /// is the only part ever displayed.
+    Copy {
+        text: Zeroizing<String>,
+        what: String,
+        /// How long until it is wiped. `None` for things that are not secret
+        /// — a public key or a fingerprint — which stay until replaced.
+        clear_after: Option<Duration>,
+    },
+    /// Wipe, but only if nothing newer has been copied since `generation`.
+    /// Sent by the sleeping task a [`Self::Copy`] spawns.
+    WipeIfOurs { generation: u64 },
+    /// Wipe a pending secret immediately, for use on the way out. The
+    /// `oneshot` is how the shutdown path waits for it.
+    WipeNow { done: oneshot::Sender<()> },
 }
 
 /// Commands for the GPG backend.
@@ -128,6 +155,10 @@ pub enum Refresh {
     Keyrings,
     SshKeys,
     GpgKeys,
+    /// Nothing — the operation only has something to say. Copying to the
+    /// clipboard changes no list, and re-reading one would move the cursor
+    /// for no reason.
+    Nothing,
 }
 
 /// The channel a backend uses to report back. Send failures mean the UI is

@@ -10,13 +10,14 @@
 //! testable without a D-Bus session, an agent or a subprocess.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossterm::event::KeyEvent;
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
 
-use crate::backend::{GpgRequest, Refresh, Reply, SecretsRequest, SshRequest};
+use crate::backend::{ClipboardRequest, GpgRequest, Refresh, Reply, SecretsRequest, SshRequest};
 use crate::input::Input;
 use crate::keys::{Action, Key, Keymaps, Mode, ModifiedKey, Resolution};
 use crate::model::{
@@ -288,6 +289,11 @@ pub struct App {
     /// navigation — a revealed password should never outlive the row it
     /// belongs to.
     pub revealed: Option<Zeroizing<String>>,
+    /// A fetch that was asked for in order to copy the secret, not to show
+    /// it. Copying needs the same round trip as revealing, but putting the
+    /// secret on screen as a side effect of a copy is the opposite of what
+    /// was asked for.
+    copy_on_reveal: bool,
 
     // SSH keys.
     pub ssh_keys: Vec<SshKeyInfo>,
@@ -331,6 +337,11 @@ pub struct App {
     secrets: UnboundedSender<SecretsRequest>,
     ssh: UnboundedSender<SshRequest>,
     gpg: UnboundedSender<GpgRequest>,
+    clipboard: UnboundedSender<ClipboardRequest>,
+    /// How long a copied secret survives before the clipboard backend wipes
+    /// it. `None` disables the wipe; public keys and fingerprints pass `None`
+    /// regardless, as they are not secret.
+    clipboard_clear_after: Option<Duration>,
 }
 
 impl App {
@@ -338,6 +349,8 @@ impl App {
         secrets: UnboundedSender<SecretsRequest>,
         ssh: UnboundedSender<SshRequest>,
         gpg: UnboundedSender<GpgRequest>,
+        clipboard: UnboundedSender<ClipboardRequest>,
+        clipboard_clear_after: Option<Duration>,
         keymaps: Keymaps,
     ) -> Self {
         let app = Self {
@@ -349,6 +362,7 @@ impl App {
             item_state: ListState::default(),
             item_filter: String::new(),
             revealed: None,
+            copy_on_reveal: false,
             ssh_keys: Vec::new(),
             ssh_state: ListState::default(),
             agent: AgentStatus::NotConfigured,
@@ -373,6 +387,8 @@ impl App {
             secrets,
             ssh,
             gpg,
+            clipboard,
+            clipboard_clear_after,
         };
         app.send(SecretsRequest::ListKeyrings);
         app
@@ -390,6 +406,19 @@ impl App {
 
     fn send_gpg(&self, request: GpgRequest) {
         let _ = self.gpg.send(request);
+    }
+
+    /// Put something on the clipboard.
+    ///
+    /// `secret` decides whether it is wiped afterwards: a password is, a
+    /// public key or a fingerprint is not — those are meant to be pasted
+    /// wherever and whenever, and wiping them would only be annoying.
+    fn copy(&mut self, text: Zeroizing<String>, what: &str, secret: bool) {
+        let _ = self.clipboard.send(ClipboardRequest::Copy {
+            text,
+            what: what.to_owned(),
+            clear_after: secret.then_some(self.clipboard_clear_after).flatten(),
+        });
     }
 
     pub fn selected_keyring(&self) -> Option<&KeyringInfo> {
@@ -488,6 +517,7 @@ impl App {
             Refresh::GpgKeys => self.send_gpg(GpgRequest::ListKeys {
                 filter: self.gpg_filter,
             }),
+            Refresh::Nothing => {}
         }
     }
 
@@ -606,6 +636,11 @@ impl App {
                 }
             }
             Action::DeleteKeyring => self.confirm(Prompt::ConfirmDeleteKeyring),
+            Action::CopySecret => self.copy_secret(),
+
+            Action::CopySshKey => self.copy_ssh(false),
+            Action::CopySshFingerprint => self.copy_ssh(true),
+            Action::CopyGpgFingerprint => self.copy_gpg_fingerprint(),
 
             Action::AgentAdd => self.add_to_agent(),
             Action::SshCopyId => self.copy_key_to_host(),
@@ -824,6 +859,68 @@ impl App {
                 self.item_filter
             )
         };
+    }
+
+    /// Copy the selected item's secret.
+    ///
+    /// An already-revealed secret is copied straight from memory; otherwise
+    /// this fetches it the way `s` does, and [`Self::copy_on_reveal`] makes
+    /// the reply go to the clipboard instead of to the screen.
+    fn copy_secret(&mut self) {
+        if self.section != Section::Keyrings {
+            return;
+        }
+        let Some(keyring) = self.selected_keyring().map(|keyring| keyring.id) else {
+            return;
+        };
+        let Some((item, label)) = self
+            .selected_item()
+            .map(|item| (item.id, item.label.clone()))
+        else {
+            return;
+        };
+
+        if let Some(secret) = self.revealed.clone() {
+            self.copy(secret, &format!("the secret for {label}"), true);
+            return;
+        }
+
+        self.copy_on_reveal = true;
+        self.send(SecretsRequest::RevealSecret { keyring, item });
+        self.status = format!("copying the secret for {label}…");
+    }
+
+    /// Copy the selected SSH key's public line, or its fingerprint.
+    ///
+    /// Neither is secret, so neither is wiped.
+    fn copy_ssh(&mut self, fingerprint: bool) {
+        if self.section != Section::SshKeys {
+            return;
+        }
+        let Some((text, what)) = self.selected_ssh_key().map(|key| {
+            if fingerprint {
+                (key.fingerprint.clone(), "the fingerprint")
+            } else {
+                (key.public_line.trim_end().to_owned(), "the public key")
+            }
+        }) else {
+            return;
+        };
+        if text.is_empty() {
+            self.status = "nothing to copy for that key".into();
+            return;
+        }
+        self.copy(Zeroizing::new(text), what, false);
+    }
+
+    fn copy_gpg_fingerprint(&mut self) {
+        if self.section != Section::GpgKeys {
+            return;
+        }
+        let Some(fingerprint) = self.selected_gpg_key().map(|key| key.fingerprint.clone()) else {
+            return;
+        };
+        self.copy(Zeroizing::new(fingerprint), "the fingerprint", false);
     }
 
     /// Ask the backend to delete the keyring under the cursor.
@@ -1348,10 +1445,23 @@ impl App {
                 item,
                 value,
             } => {
-                // Only show it if the cursor is still on the row we asked for.
+                // Only act on it if the cursor is still on the row we asked
+                // for; otherwise this secret belongs to a row the user left.
                 let still_current = self.selected_keyring().map(|k| k.id) == Some(keyring)
                     && self.selected_item().map(|i| i.id) == Some(item);
-                if still_current {
+                if !still_current {
+                    self.copy_on_reveal = false;
+                    return;
+                }
+                if std::mem::take(&mut self.copy_on_reveal) {
+                    let label = self
+                        .selected_item()
+                        .map(|item| item.label.clone())
+                        .unwrap_or_default();
+                    // Deliberately not also assigned to `revealed`: a copy
+                    // must not put the secret on screen.
+                    self.copy(value, &format!("the secret for {label}"), true);
+                } else {
                     self.revealed = Some(value);
                 }
             }
@@ -1446,11 +1556,16 @@ mod tests {
 
     use super::*;
 
+    /// The wipe delay the harness runs with, so a test can assert on the one
+    /// the request carries rather than on whatever the default happens to be.
+    const TEST_CLEAR_AFTER: Duration = Duration::from_secs(30);
+
     struct Harness {
         app: App,
         secrets: UnboundedReceiver<SecretsRequest>,
         ssh: UnboundedReceiver<SshRequest>,
         gpg: UnboundedReceiver<GpgRequest>,
+        clipboard: UnboundedReceiver<ClipboardRequest>,
     }
 
     impl Harness {
@@ -1458,11 +1573,20 @@ mod tests {
             let (secrets_tx, secrets) = mpsc::unbounded_channel();
             let (ssh_tx, ssh) = mpsc::unbounded_channel();
             let (gpg_tx, gpg) = mpsc::unbounded_channel();
+            let (clip_tx, clipboard) = mpsc::unbounded_channel();
             Self {
-                app: App::new(secrets_tx, ssh_tx, gpg_tx, Keymaps::default()),
+                app: App::new(
+                    secrets_tx,
+                    ssh_tx,
+                    gpg_tx,
+                    clip_tx,
+                    Some(TEST_CLEAR_AFTER),
+                    Keymaps::default(),
+                ),
                 secrets,
                 ssh,
                 gpg,
+                clipboard,
             }
         }
 
@@ -1494,10 +1618,29 @@ mod tests {
             out
         }
 
+        /// What the clipboard backend was asked to copy, as
+        /// `(text, what, clear_after)`. The text is only exposed here so a
+        /// test can prove the right bytes were sent.
+        fn clipboard_requests(&mut self) -> Vec<(String, String, Option<Duration>)> {
+            let mut out = Vec::new();
+            while let Ok(request) = self.clipboard.try_recv() {
+                if let ClipboardRequest::Copy {
+                    text,
+                    what,
+                    clear_after,
+                } = request
+                {
+                    out.push((text.to_string(), what, clear_after));
+                }
+            }
+            out
+        }
+
         fn drain(&mut self) {
             self.secrets_requests();
             self.ssh_requests();
             self.gpg_requests();
+            self.clipboard_requests();
         }
 
         /// Two keyrings loaded, cursor on the first, its items listed.
@@ -2189,6 +2332,182 @@ mod tests {
             harness.secrets_requests(),
             vec![SecretsRequest::ListItems { keyring: 0 }]
         );
+    }
+
+    #[test]
+    fn copying_a_secret_fetches_it_without_showing_it() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('y'));
+
+        // Same round trip as revealing: the secret is not in the list reply.
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::RevealSecret {
+                keyring: 0,
+                item: 0
+            }]
+        );
+
+        harness.app.on_reply(Reply::Secret {
+            keyring: 0,
+            item: 0,
+            value: Zeroizing::new("hunter2".into()),
+        });
+
+        assert_eq!(
+            harness.clipboard_requests(),
+            vec![(
+                "hunter2".to_string(),
+                "the secret for alpha".to_string(),
+                Some(TEST_CLEAR_AFTER)
+            )]
+        );
+        assert!(
+            harness.app.revealed.is_none(),
+            "a copy must not put the secret on screen as a side effect"
+        );
+    }
+
+    #[test]
+    fn an_already_revealed_secret_is_copied_without_a_second_fetch() {
+        let mut harness = Harness::loaded();
+        harness.app.on_reply(Reply::Secret {
+            keyring: 0,
+            item: 0,
+            value: Zeroizing::new("hunter2".into()),
+        });
+        harness.drain();
+        assert!(harness.app.revealed.is_some());
+
+        harness.press(KeyCode::Char('y'));
+        assert!(
+            harness.secrets_requests().is_empty(),
+            "it is already in memory"
+        );
+        assert_eq!(harness.clipboard_requests().len(), 1);
+        assert!(
+            harness.app.revealed.is_some(),
+            "and copying does not hide what was already shown"
+        );
+    }
+
+    #[test]
+    fn a_secret_fetched_for_a_copy_is_dropped_if_the_cursor_moved() {
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('y'));
+        harness.drain();
+
+        // The reply names item 0, but the cursor is on item 1 by the time it
+        // lands — so it belongs to a row the user has left.
+        harness.press(KeyCode::Char('l'));
+        harness.press(KeyCode::Char('j'));
+        harness.app.on_reply(Reply::Secret {
+            keyring: 0,
+            item: 0,
+            value: Zeroizing::new("hunter2".into()),
+        });
+
+        assert!(
+            harness.clipboard_requests().is_empty(),
+            "a stale secret must not reach the clipboard"
+        );
+        assert!(harness.app.revealed.is_none());
+
+        // And the dropped copy must not leave the flag armed, or the next
+        // plain reveal would silently copy instead of displaying.
+        harness.app.on_reply(Reply::Secret {
+            keyring: 0,
+            item: 1,
+            value: Zeroizing::new("correct horse".into()),
+        });
+        assert!(harness.clipboard_requests().is_empty());
+        assert!(
+            harness.app.revealed.is_some(),
+            "this one was a plain reveal"
+        );
+    }
+
+    #[test]
+    fn copying_a_public_key_is_not_wiped_afterwards() {
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('y'));
+
+        let copied = harness.clipboard_requests();
+        assert_eq!(copied.len(), 1);
+        let (text, what, clear_after) = &copied[0];
+        assert!(text.starts_with("ssh-"), "the openssh line: {text}");
+        assert_eq!(what, "the public key");
+        assert_eq!(
+            *clear_after, None,
+            "a public key is not secret, and wiping it would only annoy"
+        );
+    }
+
+    #[test]
+    fn capital_y_copies_a_fingerprint_in_both_key_sections() {
+        let mut harness = Harness::ssh_loaded();
+        harness.press(KeyCode::Char('Y'));
+        let copied = harness.clipboard_requests();
+        assert_eq!(copied[0].0, "SHA256:id_ecdsa");
+        assert_eq!(copied[0].2, None);
+
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('Y'));
+        let copied = harness.clipboard_requests();
+        assert_eq!(copied[0].0, "FPR0");
+        assert_eq!(copied[0].2, None);
+    }
+
+    #[test]
+    fn y_exports_in_gpg_but_copies_in_the_other_sections() {
+        // `y` is the armoured export in GPG, so the fingerprint went to `Y`
+        // and `y` keeps its old meaning there.
+        let mut harness = Harness::gpg_loaded();
+        harness.press(KeyCode::Char('y'));
+        assert!(harness.clipboard_requests().is_empty());
+        let external = harness.app.take_external().expect("gpg --export");
+        assert!(external.args().contains(&"--export".to_string()));
+
+        let mut harness = Harness::loaded();
+        harness.press(KeyCode::Char('y'));
+        assert!(harness.app.take_external().is_none());
+        assert_eq!(
+            harness.secrets_requests(),
+            vec![SecretsRequest::RevealSecret {
+                keyring: 0,
+                item: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn a_copy_reports_nothing_to_refresh() {
+        // Re-reading a list after a copy would move the cursor for no reason.
+        let mut harness = Harness::loaded();
+        harness.app.on_reply(Reply::Status {
+            message: "copied the secret for alpha — clearing in 30s".into(),
+            refresh: Refresh::Nothing,
+        });
+        assert!(harness.secrets_requests().is_empty());
+        assert!(harness.ssh_requests().is_empty());
+        assert!(harness.gpg_requests().is_empty());
+    }
+
+    #[test]
+    fn copy_does_nothing_without_a_selection() {
+        let mut harness = Harness::new();
+        harness
+            .app
+            .on_reply(Reply::Keyrings(vec![keyring(0, "Login", true)]));
+        harness.app.on_reply(Reply::Items {
+            keyring: 0,
+            items: Vec::new(),
+        });
+        harness.drain();
+
+        harness.press(KeyCode::Char('y'));
+        assert!(harness.secrets_requests().is_empty());
+        assert!(harness.clipboard_requests().is_empty());
     }
 
     #[test]
@@ -2949,11 +3268,20 @@ mod tests {
         let (secrets_tx, secrets) = mpsc::unbounded_channel();
         let (ssh_tx, ssh) = mpsc::unbounded_channel();
         let (gpg_tx, gpg) = mpsc::unbounded_channel();
+        let (clip_tx, clipboard) = mpsc::unbounded_channel();
         let mut harness = Harness {
-            app: App::new(secrets_tx, ssh_tx, gpg_tx, Keymaps::resolve(&wrapper.keys)),
+            app: App::new(
+                secrets_tx,
+                ssh_tx,
+                gpg_tx,
+                clip_tx,
+                Some(TEST_CLEAR_AFTER),
+                Keymaps::resolve(&wrapper.keys),
+            ),
             secrets,
             ssh,
             gpg,
+            clipboard,
         };
         harness.app.on_reply(Reply::Keyrings(vec![
             keyring(0, "Login", false),

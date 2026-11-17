@@ -76,6 +76,7 @@ pub enum Action {
     DeleteItem,
     NewKeyring,
     DeleteKeyring,
+    CopySecret,
 
     // SSH keys.
     AgentAdd,
@@ -84,6 +85,8 @@ pub enum Action {
     SshCopyId,
     SshPassphrase,
     SshDelete,
+    CopySshKey,
+    CopySshFingerprint,
 
     // GPG keys.
     GpgEdit,
@@ -94,6 +97,7 @@ pub enum Action {
     ToggleGpgFilter,
     GpgImport,
     GpgSearch,
+    CopyGpgFingerprint,
 
     // Prompts.
     Confirm,
@@ -139,12 +143,15 @@ impl Action {
             Self::DeleteItem => "delete the stored secret",
             Self::NewKeyring => "new keyring",
             Self::DeleteKeyring => "delete the keyring and everything in it",
+            Self::CopySecret => "copy the secret to the clipboard",
             Self::AgentAdd => "add to the ssh-agent (runs ssh-add)",
             Self::AgentRemove => "remove from the ssh-agent",
             Self::NewSshKey => "new SSH key (runs ssh-keygen)",
             Self::SshCopyId => "copy this key to a host (runs ssh-copy-id)",
             Self::SshPassphrase => "change or remove the passphrase (runs ssh-keygen -p)",
             Self::SshDelete => "delete the key files",
+            Self::CopySshKey => "copy the public key line to the clipboard",
+            Self::CopySshFingerprint => "copy the fingerprint to the clipboard",
             Self::GpgEdit => "edit: trust, expiry, UIDs, revoke, certify",
             Self::GpgExport => "print the armoured public key",
             Self::GpgPublish => "publish to a keyserver",
@@ -153,6 +160,7 @@ impl Action {
             Self::ToggleGpgFilter => "show all keys / only secret keys",
             Self::GpgImport => "import keys from a file",
             Self::GpgSearch => "search a keyserver",
+            Self::CopyGpgFingerprint => "copy the fingerprint to the clipboard",
             Self::Confirm => "confirm",
             Self::Cancel => "cancel",
             Self::Choose1 => "first choice",
@@ -178,13 +186,16 @@ impl Action {
             | Self::FilterItems
             | Self::DeleteItem
             | Self::NewKeyring
-            | Self::DeleteKeyring => Some(Section::Keyrings),
+            | Self::DeleteKeyring
+            | Self::CopySecret => Some(Section::Keyrings),
             Self::AgentAdd
             | Self::AgentRemove
             | Self::NewSshKey
             | Self::SshCopyId
             | Self::SshPassphrase
-            | Self::SshDelete => Some(Section::SshKeys),
+            | Self::SshDelete
+            | Self::CopySshKey
+            | Self::CopySshFingerprint => Some(Section::SshKeys),
             Self::GpgEdit
             | Self::GpgExport
             | Self::GpgPublish
@@ -192,7 +203,8 @@ impl Action {
             | Self::NewGpgKey
             | Self::GpgImport
             | Self::GpgSearch
-            | Self::ToggleGpgFilter => Some(Section::GpgKeys),
+            | Self::ToggleGpgFilter
+            | Self::CopyGpgFingerprint => Some(Section::GpgKeys),
             _ => None,
         }
     }

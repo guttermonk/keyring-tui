@@ -55,12 +55,18 @@ fn main() -> Keymap {
         // `n` is "new" in every section; `D` is the bigger delete, as in SSH.
         bind(Action::NewKeyring, "n"),
         bind(Action::DeleteKeyring, "D"),
+        // `y` yanks the useful thing in each section. In GPG that key is
+        // already the armoured export, so the fingerprint goes on `Y` — and
+        // SSH mirrors it so `Y` means "the identifier" in both.
+        bind(Action::CopySecret, "y"),
         // SSH keys.
         bind(Action::AgentAdd, "a"),
         bind(Action::AgentRemove, "x"),
         bind(Action::NewSshKey, "n"),
         bind(Action::SshCopyId, "c"),
         bind(Action::SshPassphrase, "p"),
+        bind(Action::CopySshKey, "y"),
+        bind(Action::CopySshFingerprint, "Y"),
         // Not `x`: that is the harmless "remove from the agent" in this
         // section, and a near-miss on it should not unlink a private key.
         bind(Action::SshDelete, "D"),
@@ -76,6 +82,7 @@ fn main() -> Keymap {
         // because ssh-copy-id belongs to the other one.
         bind(Action::GpgImport, "i"),
         bind(Action::GpgSearch, "/"),
+        bind(Action::CopyGpgFingerprint, "Y"),
     ])
 }
 

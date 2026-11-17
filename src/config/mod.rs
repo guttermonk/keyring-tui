@@ -8,6 +8,7 @@
 //! one is an error naming the file, because a config that silently does
 //! nothing is worse than one that refuses to load.
 
+pub mod clipboard;
 pub mod theme;
 
 use std::collections::BTreeMap;
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::keys::{KeymapSection, Keymaps, Mode};
+use clipboard::Clipboard;
 use theme::{Palette, Theme};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +27,7 @@ pub struct Config {
     pub theme: Theme,
     /// `[keys.main]`, `[keys.prompt]`.
     pub keys: BTreeMap<Mode, KeymapSection>,
+    pub clipboard: Clipboard,
 
     /// Slots the overlay supplied, and slots it named that are not slots at
     /// all. Filled in during loading, never read from the file — hence

@@ -588,17 +588,20 @@ fn hint_line(app: &App) -> String {
             (Action::ToggleSecret, "secret"),
             (Action::FilterItems, "filter"),
             (Action::NewKeyring, "new"),
+            (Action::CopySecret, "copy"),
         ],
         Section::SshKeys => &[
             (Action::AgentAdd, "add"),
             (Action::AgentRemove, "remove"),
             (Action::NewSshKey, "new"),
             (Action::SshPassphrase, "passphrase"),
+            (Action::CopySshKey, "copy"),
         ],
         Section::GpgKeys => &[
             (Action::GpgEdit, "edit"),
             (Action::GpgExport, "export"),
             (Action::NewGpgKey, "new"),
+            (Action::CopyGpgFingerprint, "copy fpr"),
         ],
     };
     for (action, label) in section_actions {
@@ -970,9 +973,10 @@ mod tests {
         let (secrets, _secrets_rx) = mpsc::unbounded_channel();
         let (ssh, _ssh_rx) = mpsc::unbounded_channel();
         let (gpg, _gpg_rx) = mpsc::unbounded_channel();
+        let (clipboard, _clip_rx) = mpsc::unbounded_channel();
         // The receivers are dropped, so requests go nowhere: these tests only
         // care about what a given state renders as.
-        App::new(secrets, ssh, gpg, Keymaps::default())
+        App::new(secrets, ssh, gpg, clipboard, None, Keymaps::default())
     }
 
     fn ssh_key(name: &str, in_agent: bool) -> SshKeyInfo {

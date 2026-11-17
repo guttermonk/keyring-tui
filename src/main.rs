@@ -15,6 +15,7 @@ use std::io;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
@@ -24,10 +25,14 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::app::{App, External};
-use crate::backend::Reply;
+use crate::backend::{ClipboardRequest, Reply};
+
+/// How long the shutdown path waits for a last clipboard wipe. Generous for
+/// a fork-and-exit tool, short enough not to be noticed as a delay on quit.
+const WIPE_ON_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 const USAGE: &str = concat!(
     env!("CARGO_PKG_NAME"),
@@ -104,7 +109,7 @@ async fn main() -> Result<()> {
     let terminal = ratatui::try_init().wrap_err("failed to set up the terminal")?;
     // Restore the terminal even if `run` returns an error or panics upstream of
     // the report being printed.
-    let outcome = run(terminal, palette, keymaps).await;
+    let outcome = run(terminal, palette, keymaps, settings.clipboard).await;
     ratatui::restore();
     outcome
 }
@@ -236,12 +241,15 @@ async fn run(
     mut terminal: ratatui::DefaultTerminal,
     palette: config::theme::Palette,
     keymaps: keys::Keymaps,
+    clipboard_settings: config::clipboard::Clipboard,
 ) -> Result<()> {
     let (reply_tx, mut replies) = mpsc::unbounded_channel::<Reply>();
     let secrets = backend::secrets::spawn(reply_tx.clone());
     let ssh = backend::ssh::spawn(reply_tx.clone());
-    let gpg = backend::gpg::spawn(reply_tx);
-    let mut app = App::new(secrets, ssh, gpg, keymaps);
+    let gpg = backend::gpg::spawn(reply_tx.clone());
+    let clear_after = clipboard_settings.clear_after();
+    let clipboard = backend::clipboard::spawn(reply_tx, clipboard_settings);
+    let mut app = App::new(secrets, ssh, gpg, clipboard.clone(), clear_after, keymaps);
 
     let mut input = EventStream::new();
 
@@ -274,6 +282,15 @@ async fn run(
             input = EventStream::new();
             app.on_external_done(&external, outcome);
         }
+    }
+
+    // Quitting before the wipe timer fires would otherwise leave a copied
+    // secret on the clipboard with nothing left running to remove it. The
+    // timeout is there because this is the shutdown path: a wedged clipboard
+    // tool must not stop the process exiting.
+    let (done, wiped) = oneshot::channel();
+    if clipboard.send(ClipboardRequest::WipeNow { done }).is_ok() {
+        let _ = tokio::time::timeout(WIPE_ON_EXIT_TIMEOUT, wiped).await;
     }
 
     Ok(())

@@ -21,6 +21,10 @@ Without Nix you need a Rust toolchain, `pkg-config`, and `libgpgme` with its
 `libgpg-error` and `libassuan` dependencies — `gpgme` is a C binding, so
 `cargo build` outside the dev shell will not find it on its own. At runtime it
 wants `gpg`, `ssh-add`/`ssh-keygen`, and a Secret Service on the session bus.
+Copying to the clipboard additionally wants `wl-clipboard`, `xclip` or `xsel`
+— see [The clipboard](#the-clipboard) for why it is an external tool. All of
+these are looked up on `PATH` when used, so a missing one costs you that one
+operation and nothing else.
 
 ```console
 nix build          # or: cargo build --release
@@ -52,6 +56,7 @@ In **Passwords**:
 | `x` | delete the selected secret — asks first |
 | `n` | new keyring — asks for a name |
 | `D` | delete the keyring and everything in it — asks first |
+| `y` | copy the secret to the clipboard, wiped after 45s |
 
 In **SSH Keys**:
 
@@ -63,6 +68,7 @@ In **SSH Keys**:
 | `c` | copy the public key to a host — asks for `[user@]host` (`ssh-copy-id`) |
 | `p` | change or remove the passphrase (`ssh-keygen -p`) |
 | `D` | delete the key files — asks first |
+| `y` / `Y` | copy the public key line / the fingerprint |
 
 In **GPG Keys**:
 
@@ -76,6 +82,7 @@ In **GPG Keys**:
 | `f` | show all keys / only keys with a private half |
 | `i` | import keys from a file — asks for a path (`gpg --import`) |
 | `/` | search a keyserver — asks for a query (`gpg --search-keys`) |
+| `Y` | copy the fingerprint to the clipboard |
 
 A key that opens a text field puts the keymap into **`input` mode**, where
 printable keys are literal text rather than bindings — so `q` types a `q`
@@ -231,15 +238,43 @@ affected list is re-read when they exit. That keeps passphrases and private
 key material out of this process entirely, and means `-sk` keys, askpass,
 pinentry and gpg's own confirmations all behave exactly as usual.
 
-The exception is the operations that need no secret to carry out: deleting a
-stored secret and unlinking a key's files happen in the backends, since there
-is no prompt for an external command to show. Both are gated behind a
+The exception is the operations that need no prompt: deleting a stored secret,
+unlinking a key's files, and copying to the clipboard all happen in the
+backends, with the TUI left up. The two deletions are gated behind a
 confirmation instead.
 
 It also sets the boundary for the GPG section: reading goes through `gpgme`,
 because structured access to user IDs, subkeys, capabilities and validity is
 worth a library; writing goes through `gpg --edit-key` and friends, because
 reimplementing gpg's prompts would be both more code and less safe.
+
+## The clipboard
+
+Copying shells out to `wl-copy`, `xclip`, `xsel` or `pbcopy` instead of
+setting the selection directly. That is not laziness: on X11 and Wayland the
+clipboard is served by a **live process**, so a selection owned by keyring-tui
+would vanish the moment keyring-tui exits — copy a password, quit, paste, get
+nothing. Those tools fork a background owner that outlives their parent, which
+is what anyone copying a password expects. One of them has to be installed;
+`[clipboard] copy` overrides the choice if detection guesses wrong.
+
+A copied **secret** is wiped after 45 seconds by default (`clear_after`, `0`
+to disable). A copied public key or fingerprint is not wiped at all: those are
+not secret, they are meant to be pasted whenever, and clearing them would only
+be annoying.
+
+The wipe reads the clipboard back first and leaves it alone if it no longer
+holds what we put there, so a copy you made in the meantime is never
+discarded. Quitting with a wipe still pending performs it on the way out,
+rather than leaving the secret behind with nothing running to remove it.
+
+The timer lives in the clipboard backend, not the event loop: a copy spawns a
+task that sleeps and then posts a wipe request. That is why an idle
+keyring-tui still has no tick.
+
+Two things it cannot promise. A clipboard **manager** that archives history
+has its own copy, and wiping the selection does not reach into its database.
+And `SIGKILL` leaves no opportunity to wipe anything.
 
 ## Handling secrets
 
@@ -248,7 +283,10 @@ reimplementing gpg's prompts would be both more code and less safe.
 * Any navigation — moving the cursor, changing pane, changing section, an
   error — drops the revealed secret immediately.
 * A reply that arrives after the cursor has moved off its row is discarded
-  rather than displayed against the wrong item.
+  rather than displayed against the wrong item — including one fetched for a
+  copy, which never reaches the clipboard if the cursor moved.
+* Copying a secret fetches it without displaying it. A copy is not a reveal,
+  so it does not put the password on screen as a side effect.
 * Passphrases for locking, unlocking and creating a keyring are never read by
   this process; the service prompts through its own agent.
 
@@ -263,8 +301,8 @@ reimplementing gpg's prompts would be both more code and less safe.
 - [x] delete an item, behind a confirmation
 - [x] filter the item list by label or attribute
 - [x] create a keyring, and delete one behind a confirmation
+- [x] copy a secret to the clipboard with a timed clear
 - [ ] create and edit items
-- [ ] copy a secret to the clipboard with a timed clear
 
 Changing a keyring's passphrase is not on this list: the Secret Service
 spec has no method for it. Seahorse does it through gnome-keyring's own
@@ -281,7 +319,7 @@ or `secret-tool` remains the way to do that.
 - [x] change or remove a key's passphrase (`ssh-keygen -p`)
 - [x] deploy a public key to a remote host (`ssh-copy-id`)
 - [x] delete a key, behind a confirmation
-- [ ] copy the public key or fingerprint to the clipboard
+- [x] copy the public key or fingerprint to the clipboard
 
 `x` and `D` are deliberately different keys. `x` removes a key from the
 agent, which costs you a re-`ssh-add`; `D` unlinks the files, which is

@@ -160,11 +160,11 @@ preset = "terminal"
 #               SectionPasswords SectionGpgKeys SectionSshKeys
 #               MoveDown MoveUp First Last FocusLeft FocusRight
 #   Passwords   Unlock Lock ToggleSecret FilterItems DeleteItem
-#               NewKeyring DeleteKeyring
+#               NewKeyring DeleteKeyring CopySecret
 #   SSH Keys    AgentAdd AgentRemove NewSshKey SshCopyId SshPassphrase
-#               SshDelete
+#               SshDelete CopySshKey CopySshFingerprint
 #   GPG Keys    GpgEdit GpgExport GpgPublish GpgDelete NewGpgKey
-#               ToggleGpgFilter GpgImport GpgSearch
+#               ToggleGpgFilter GpgImport GpgSearch CopyGpgFingerprint
 #
 # Actions in the `prompt` mode: Confirm Cancel Choose1 Choose2 Choose3.
 #
@@ -212,3 +212,28 @@ preset = "terminal"
 #     ["Confirm", "enter"],
 #     ["Cancel",  "backspace"],
 # ]
+
+[clipboard]
+# Seconds before a copied SECRET is wiped from the clipboard. 0 disables the
+# wipe. Public keys and fingerprints are not secret and are never wiped --
+# they are meant to be pasted whenever, and clearing them would only annoy.
+#
+# The wipe reads the clipboard back first and leaves it alone if it no longer
+# holds what keyring-tui put there, so a copy you made in the meantime is
+# never discarded. Quitting with a wipe still pending does it on the way out.
+# clear_after = 45
+
+# Which commands reach the clipboard. Left unset, keyring-tui picks by what
+# the session looks like and what is installed: wl-copy on Wayland, then
+# xclip or xsel on X11, then pbcopy. Set these only if that guesses wrong.
+#
+# `copy` receives the text on standard input. `paste` is how the wipe checks
+# what is on the clipboard before clearing it; give it alongside `copy` or
+# the wipe goes ahead without looking.
+#
+# copy  = ["wl-copy", "--type", "text/plain"]
+# paste = ["wl-paste", "--no-newline", "--type", "text/plain"]
+#
+# A tmux buffer instead of the X/Wayland clipboard:
+# copy  = ["tmux", "load-buffer", "-"]
+# paste = ["tmux", "save-buffer", "-"]
